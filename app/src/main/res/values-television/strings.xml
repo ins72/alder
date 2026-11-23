@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The words as the TV shows them. Phones and tablets read the neutral wording in values/strings.xml. -->
+<resources>
+    <string name="home_unreachable">Couldn\'t reach Stremio. Check the TV\'s connection.</string>
+    <string name="addons_unreachable">Couldn\'t reach Stremio. Check the TV\'s internet.</string>
+    <string name="hint_picture">Choose the picture and sound this TV can play.</string>
+    <string name="hint_storage">Storage on this TV only.</string>
+    <string name="frame_rate_hint">The TV switches to the film\'s rate so pans don\'t judder.</string>
+    <string name="ui_size_hint">Makes text, posters and buttons bigger on every screen, for a TV far from your seat.</string>
+    <string name="player_no_other_app">No other video player is on this TV. Alder plays the video.</string>
+    <string name="clear_dialogue_setting_hint">Lifts voices above music and loud effects when using TV speakers.</string>
+    <string name="share_streams_hint">Other profiles on this TV can find sources with this profile\'s stream add-ons. Your add-on\'s provider may see what they play.</string>
+    <string name="shared_by_hint">%1$s shares these stream add-ons with every profile on this TV. Your history stays yours.</string>
+    <string name="more_filters_desc">Release groups, codecs, languages and more are set in your streaming add-on on your phone or at web.stremio.com. This TV follows its order.</string>
+    <string name="tv_language">TV language</string>
+    <string name="tv_language_named">TV language (%1$s)</string>
+    <string name="clear_storage_hint">Removes profiles, settings and saved data from this TV. Stremio accounts stay as they are.</string>
+    <string name="clear_storage_desc">This removes saved profiles, settings and cached data from this TV. It does not cancel your Stremio account.</string>
+    <string name="about_hint">Alder is a TV interface for your Stremio account.</string>
+    <string name="about_desc">A TV interface for your Stremio account.</string>
+    <string name="whats_new_hint">The changes in the version on this TV.</string>
+    <string name="report_send_hint">Sends the last crash, recent error types and retry results, the Alder version, and the TV model. It has no account details.</string>
+    <string name="report_crashed_desc">Send a report to help fix it? It includes the crash, recent error types and retry results, and the TV model.</string>
+    <string name="no_sources_torrents">%1$s found only torrents. A TV plays torrents through a debrid service, such as Real-Debrid, connected in the add-on\'s settings.</string>
+    <string name="trailer_no_app">No app on this TV can play the trailer. Install YouTube to watch it.</string>
+    <string name="progress_saved_on_tv">Progress saved on this TV. Alder will try to sync it again.</string>
+    <string name="failure_advice_secure">Check the date and time on your TV, then try again.</string>
+</resources>

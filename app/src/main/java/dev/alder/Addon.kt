@@ -1,0 +1,836 @@
+package dev.alder
+
+import android.net.Uri
+import org.json.JSONArray
+import org.json.JSONObject
+import androidx.media3.common.MimeTypes
+import java.io.IOException
+import java.util.Locale
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.TimeUnit
+
+/**
+ * One installed addon, spoken to with the Stremio addon protocol: plain GETs for catalogs, metadata and streams.
+ * [descriptor] is the account's entry for it as Stremio stores it, kept whole so it can be copied to another profile.
+ */
+open class Addon(val descriptor: JSONObject) {
+    // An entry with a broken manifest stays in the list with nothing to show: dropping it would drop it from the
+    // account too, the next time My add-ons saves the list.
+    private val manifest: JSONObject = descriptor.optJSONObject("manifest") ?: JSONObject()
+    val id: String = manifest.optString("id")
+    val name: String = manifest.text("name") ?: "" // optString would return "null" for JSON null
+    val transportUrl: String = descriptor.optString("transportUrl")
+    /** Stremio's built-ins (Cinemeta, Local Files), which every account already has. */
+    val official = descriptor.optJSONObject("flags")?.optBoolean("official") == true
+    /** Stremio's own that can't be removed (Cinemeta, Local Files); they can still be moved. */
+    val locked = descriptor.optJSONObject("flags")?.optBoolean("protected") == true
+    val providesStreams: Boolean = manifest.optJSONArray("resources").items().any {
+        (it as? String ?: (it as? JSONObject)?.optString("name")) == "stream"
+    }
+    /** Reads one person's history or lists (MyTrakt also declares `stream`): never shared or copied by default. */
+    val personal = listOf("watchly", "trakt", "simkl", "syncribullet", "aiolists").any { name.contains(it, ignoreCase = true) }
+    /** What a profile lends when it shares its streaming sources: its own stream add-ons, not Stremio's or personal ones. */
+    val shareable get() = !official && providesStreams && !personal
+    private val base = transportUrl.removeSuffix("/manifest.json")
+    /**
+     * Its settings page, when it has one (`behaviorHints.configurable`), as a fresh setup: the install's own address
+     * carries its settings and often a debrid key, which a code on the screen mustn't show.
+     */
+    val configureUrl: String? = base.takeIf { manifest.optJSONObject("behaviorHints")?.optBoolean("configurable") == true }
+        ?.let(::freshConfigureUrl)
+
+    /**
+     * [pages]: the catalog takes Stremio's `skip` extra, so a row can ask for the titles after the first page.
+     * [required]: extras it can't be asked without, with the value Stremio would pick (`genre` → "None").
+     */
+    class Catalog(val addon: Addon, val type: String, val id: String, val name: String, val pages: Boolean, val genres: List<String>,
+                  val required: Map<String, String> = emptyMap())
+
+    /**
+     * Catalogs Home can show. One with a required extra is asked with that extra's default or first option, as
+     * Stremio's Discover does: AIOMetadata marks the genre of every catalog not shown on Stremio's board as required
+     * (its first option "None"), and skipping those left a Shows page with no rows. A required extra with no options
+     * (a search query) still leaves the catalog out.
+     */
+    val catalogs: List<Catalog> = manifest.optJSONArray("catalogs").objects().mapNotNull { c ->
+        val type = c.text("type") ?: return@mapNotNull null // one broken catalog leaves out only itself
+        val catalogId = c.text("id") ?: return@mapNotNull null
+        val extra = c.optJSONArray("extra").objects()
+        val extras = c.optJSONArray("extraSupported").strings() + extra.map { it.optString("name") }
+        // The genres it can filter by: the protocol's `genre` extra options, or the older `genres` list.
+        val options = extra.firstOrNull { it.optString("name") == "genre" }?.optJSONArray("options").strings()
+            .ifEmpty { c.optJSONArray("genres").strings() }
+        val requiredNames = c.optJSONArray("extraRequired").strings() + extra.filter { it.optBoolean("isRequired") }.map { it.optString("name") }
+        val required = requiredNames.distinct().associateWith { name ->
+            val own = extra.firstOrNull { it.optString("name") == name }
+            val choices = own?.optJSONArray("options").strings().ifEmpty { if (name == "genre") options else emptyList() }
+            own?.text("default")?.takeIf { it in choices } ?: choices.firstOrNull() ?: return@mapNotNull null
+        }
+        Catalog(this, type, catalogId, c.text("name") ?: catalogId, "skip" in extras,
+            options.filterNot { it.equals("None", ignoreCase = true) }, required) // "None" is no filter, not a genre
+    }
+
+    /** Whether this addon answers [resource] ("meta", "stream", …) for this type and id. */
+    fun serves(resource: String, type: String, id: String): Boolean {
+        val entry = manifest.optJSONArray("resources").items()
+            .firstOrNull { (it as? String ?: (it as? JSONObject)?.optString("name")) == resource } ?: return false
+        val own = entry as? JSONObject
+        // As stremio-core's is_resource_supported: a resource written out in full uses only its own prefixes (none
+        // means every id), and an empty list also means every id. Reading [] as "no id" left such add-ons unasked.
+        val types = (own?.optJSONArray("types") ?: manifest.optJSONArray("types")).strings()
+        val prefixes = (if (own != null) own.optJSONArray("idPrefixes") else manifest.optJSONArray("idPrefixes"))?.strings()
+        return type in types && (prefixes.isNullOrEmpty() || prefixes.any { id.startsWith(it) })
+    }
+
+    // Catalogs (one [genre] of them with Stremio's `genre` extra) and details are kept on disk as they arrive; the saved*
+    // versions read last time's answer, no network.
+    fun catalog(c: Catalog, genre: String? = null, timeoutMs: Int = 20_000): List<Meta> =
+        JSONObject(Http.get(catalogUrl(c, genre), true, timeoutMs, strict = true)).getJSONArray("metas").objects().metas()
+
+    /** The titles after the first [skip] (Stremio's paging extra); not kept on disk. */
+    fun catalog(c: Catalog, skip: Int): List<Meta> =
+        JSONObject(Http.get(catalogUrl(c, null, skip), strict = true)).getJSONArray("metas").objects().metas()
+
+    fun savedCatalog(c: Catalog, genre: String? = null): List<Meta>? =
+        Http.savedAnswer(catalogUrl(c, genre))?.let { runCatching { JSONObject(it) }.getOrNull() }?.optJSONArray("metas")?.objects()?.metas()
+
+    /** /catalog/type/id/genre=Drama&skip=20.json: the catalog's required extras, the [genre] picked, and the page. */
+    private fun catalogUrl(c: Catalog, genre: String?, skip: Int = 0): String {
+        val extras = c.required + listOfNotNull(genre?.let { "genre" to it }, ("skip" to "$skip").takeIf { skip > 0 })
+        val path = url(arrayOf("catalog", c.type, c.id))
+        if (extras.isEmpty()) return path
+        return path.removeSuffix(".json") + "/" + extras.entries.joinToString("&") { (k, v) -> "$k=${Uri.encode(v)}" } + ".json"
+    }
+
+    /** Every search catalog the addon advertises, as Stremio's catalog protocol specifies. */
+    fun search(query: String): List<Meta> = searchCatalogs(query).let { (titles, failure) ->
+        if (titles.isEmpty() && failure != null) throw failure
+        titles
+    }
+
+    internal fun searchCatalogs(query: String): Pair<List<Meta>, Throwable?> {
+        require(query.isNotBlank())
+        val catalogs = manifest.optJSONArray("catalogs").objects()
+            .filter { c ->
+                c.optString("type") in listOf("movie", "series") &&
+                    "search" in (c.optJSONArray("extraRequired").strings() + c.optJSONArray("extraSupported").strings() +
+                        c.optJSONArray("extra").objects().map { it.optString("name") }) &&
+                    c.optJSONArray("extraRequired").strings().all { it == "search" } &&
+                    c.optJSONArray("extra").objects().none { it.optBoolean("isRequired") && it.optString("name") != "search" }
+            }
+            .distinctBy { it.optString("type") to it.optString("id") }
+        fun fetch(c: JSONObject): List<Meta> {
+            val path = url(arrayOf("catalog", c.getString("type"), c.getString("id"))).removeSuffix(".json")
+            val searchUrl = "$path/search=${Uri.encode(query)}.json"
+            val answer = JSONObject(Http.get(searchUrl, timeoutMs = 5_000, strict = true))
+            return answer.getJSONArray("metas").objects().metas()
+        }
+        val completion = ExecutorCompletionService<Pair<Int, Result<List<Meta>>>>(catalogSearchPool)
+        val pending = catalogs.mapIndexed { index, catalog -> completion.submit { index to runCatching { fetch(catalog) } } }
+        val deadline = System.currentTimeMillis() + 5_000
+        val answers = mutableListOf<Pair<Int, List<Meta>>>()
+        var failure: Throwable? = null
+        try {
+            repeat(catalogs.size) {
+                val finished = completion.poll((deadline - System.currentTimeMillis()).coerceAtLeast(0), TimeUnit.MILLISECONDS)
+                if (finished == null) {
+                    if (failure == null) failure = java.net.SocketTimeoutException()
+                    return@repeat
+                }
+                val (index, result) = finished.get()
+                result.fold({ answers += index to it }, { if (failure == null) failure = it })
+            }
+        } finally { pending.forEach { it.cancel(true) } }
+        return answers.sortedBy { it.first }.flatMap { it.second } to failure
+    }
+
+    fun meta(type: String, id: String): Meta? = get(true, "meta", type, id, strict = true).optJSONObject("meta")?.let { meta(it, id) }
+
+    fun savedMeta(type: String, id: String, maxAgeMs: Long? = null): Meta? =
+        saved("meta", type, id, maxAgeMs = maxAgeMs)?.optJSONObject("meta")?.let { meta(it, id) }
+
+    /** Some add-ons leave the title's own id out of its details: it's the one asked for. */
+    private fun meta(json: JSONObject, id: String) = Meta(if (json.text("id") == null) json.put("id", id) else json)
+
+    /** A title-specific catalog, when an installed addon advertises the protocol's required `similar` extra. */
+    fun similar(type: String, id: String): List<Meta>? {
+        val catalog = manifest.optJSONArray("catalogs").objects().firstOrNull { c ->
+            c.optString("type") == type && c.optJSONArray("extra").objects().any {
+                it.optString("name") == "similar" && it.optBoolean("isRequired")
+            } && c.optJSONArray("idPrefixes").strings().let { it.isEmpty() || it.any(id::startsWith) }
+        } ?: return null
+        val path = url(arrayOf("catalog", type, catalog.getString("id"))).removeSuffix(".json")
+        return JSONObject(Http.get("$path/similar=${Uri.encode(id, ":")}.json", true))
+            .optJSONArray("metas").objects().metas()
+    }
+
+    /**
+     * Include P2P sources only for the manual source list on supported devices. A 404 means no sources.
+     */
+    open fun streams(type: String, videoId: String, allowTorrents: Boolean = false): Streams {
+        val all = try {
+            // Debrid add-ons searching uncached titles (Comet, MediaFusion, AIOStreams) can take longer than 20 s.
+            JSONObject(Http.get(url(arrayOf("stream", type, videoId)), false, STREAM_WAIT, strict = true)).optJSONArray("streams").objects()
+        } catch (e: HttpError) {
+            if (e.code == 404) emptyList<JSONObject>() else throw e
+        }
+        val playable = all.mapNotNull { Stream.from(it, allowTorrents) }
+        return Streams(playable,
+            all.count { stream -> stream.text("url")?.let(TorrentSource::isTorrentUrl) ?: (stream.text("infoHash") != null) } -
+                playable.count { it.torrent != null },
+            all.count { it.text("url") == null && it.text("infoHash") == null && (it.text("externalUrl") ?: it.text("ytId")) != null })
+    }
+
+    /**
+     * What Alder can't play, counted to say why: [torrents], a torrent with no debrid link, and
+     * [links], a page for a browser or a YouTube video (externalUrl, ytId).
+     */
+    class Streams(val playable: List<Stream>, val torrents: Int, val links: Int)
+
+    /**
+     * Subtitle files for one video (OpenSubtitles and co. through Stremio's `subtitles` resource). The [stream]'s size
+     * and file name, when known, go along as Stremio's extras so the addon puts files made for that release first.
+     */
+    open fun subtitles(type: String, videoId: String, stream: Stream? = null): List<Subtitle> {
+        val extras = subtitleExtras(stream?.filename, stream?.size ?: 0L)
+        val path = url(arrayOf("subtitles", type, videoId))
+        val request = if (extras.isEmpty()) path else path.removeSuffix(".json") + "/" + extras + ".json"
+        return JSONObject(Http.get(request, false)).optJSONArray("subtitles").objects().mapNotNull { s ->
+            Subtitle(s.text("url") ?: return@mapNotNull null, s.text("lang") ?: "und", name)
+        }
+    }
+
+    // Ids such as "tt0903747:1:2" keep their colons, like Stremio's own requests.
+    private fun url(path: Array<out String>) = base + "/" + path.joinToString("/") { Uri.encode(it, ":=") } + ".json"
+
+    private fun get(keep: Boolean, vararg path: String, strict: Boolean = false) = JSONObject(Http.get(url(path), keep, strict = strict))
+
+    private fun saved(vararg path: String, maxAgeMs: Long? = null) =
+        Http.savedAnswer(url(path), maxAgeMs = maxAgeMs)?.let { runCatching { JSONObject(it) }.getOrNull() }
+
+    private companion object {
+        val catalogSearchPool by lazy { Images.newestFirst(8) } // lazy: unit tests make Addons without Android
+        const val STREAM_WAIT = 45_000 // ms
+    }
+}
+
+/**
+ * A title's details from the first add-on, in the account's order, that has them, as Stremio's apps do: one that fails
+ * or doesn't know the title (a metadata add-on without its API key, a catalog add-on that claims details) passes to the
+ * next, instead of "Couldn't load this title's details" on every title. [together] asks them all at once, for a screen
+ * that waits on the answer: a dead add-on then costs no more than its own wait. Otherwise one at a time, so Home's
+ * cards don't ask every add-on for every title.
+ */
+fun List<Addon>.meta(type: String, id: String, together: Boolean = false, reportFailure: Boolean = false): Meta? {
+    val serving = filter { it.serves("meta", type, id) }
+    fun ask(a: Addon) = runCatching { a.meta(type, id) }
+    val answers = if (!together || serving.size < 2) serving.asSequence().map(::ask)
+        else serving.map { a -> metaPool.submit<Result<Meta?>> { ask(a) } }.asSequence().map { it.get() }
+    var failure: Throwable? = null
+    for (answer in answers) {
+        answer.getOrNull()?.let { return it }
+        if (failure == null) failure = answer.exceptionOrNull()
+    }
+    if (reportFailure) failure?.let { throw it }
+    return null
+}
+
+/** Last time's details from disk, from the first add-on in the account's order that kept some; no network. */
+fun List<Addon>.savedMeta(type: String, id: String, maxAgeMs: Long? = null): Meta? =
+    filter { it.serves("meta", type, id) }.firstNotNullOfOrNull { runCatching { it.savedMeta(type, id, maxAgeMs) }.getOrNull() }
+
+private val metaPool = java.util.concurrent.Executors.newCachedThreadPool()
+
+class Meta(json: JSONObject) {
+    val id: String = json.getString("id")
+    val type: String = json.optString("type")
+    val name: String = json.text("name") ?: ""
+    val poster = json.text("poster")
+    val background = json.text("background")
+    /** The title as artwork (AIOMetadata and Cinemeta provide it), shown instead of plain text when present. */
+    val logo = json.text("logo")
+    /** "poster" (the default), "square" or "landscape": live channels send their logo as a square or wide picture. */
+    val posterShape = json.text("posterShape")
+    val description = json.text("description")
+    val year = json.text("releaseInfo")?.trimEnd('–', '-', ' ') // "2026–" (still running) reads as 2026 everywhere
+    val runtime = json.text("runtime")?.let(::runtime)
+    val rating = json.text("imdbRating")
+    /** Content rating (PG-13, TV-MA) when the meta add-on sends one; otherwise IMDb fills it in on the title page. */
+    val certification = json.text("certification") ?: json.text("contentRating")
+    val genres = json.optJSONArray("genres").strings().take(3)
+    val directors: List<String> = (json.optJSONArray("director") ?: json.optJSONArray("directors"))?.strings()
+        ?: json.text("director")?.split(",")?.map { it.trim() }?.filter { it.isNotEmpty() }
+        ?: emptyList()
+    val castMembers: List<CastMember> = (json.optJSONArray("cast") ?: json.optJSONArray("actors"))?.items()?.mapNotNull { item ->
+        when (item) {
+            is String -> item.trim().takeIf { it.isNotBlank() }?.let { CastMember(it) }
+            is JSONObject -> {
+                val name = item.text("name") ?: item.text("actor") ?: return@mapNotNull null
+                val character = item.text("character") ?: item.text("role")
+                val photo = item.text("photo") ?: item.text("image") ?: item.text("profile") ?: item.text("thumbnail")
+                CastMember(name.trim(), character?.trim(), photo?.trim())
+            }
+            else -> null
+        }
+    } ?: emptyList()
+    val cast: List<String> = castMembers.map { it.name }
+    val info = listOfNotNull(year, runtime, genres.joinToString(" · ").ifEmpty { null }).joinToString("   ")
+    val trailerStreams: List<Stream> = parseTrailerStreams(json)
+    val trailerYtId: String? = parseTrailerYtId(json)
+
+    /** Episodes in play order: by season then episode, specials (season 0) last. */
+    val videos: List<Video> = json.optJSONArray("videos").objects()
+        .filter { it.text("id") != null } // one episode without an id shouldn't lose the whole title
+        .map {
+            Video(it.getString("id"), it.text("title") ?: it.text("name") ?: "", it.optInt("season"), it.optInt("episode"),
+                it.text("thumbnail"), it.text("overview") ?: it.text("description"),
+                it.text("released") ?: it.text("available"), it.text("runtime")?.let(::runtime))
+        }
+        .sortedWith(compareBy({ if (it.season == 0) Int.MAX_VALUE else it.season }, { it.episode }))
+}
+
+/** [lang] is what the addon sends: ISO 639-2 ("eng") from OpenSubtitles, sometimes a two-letter code. */
+class Subtitle(val url: String, val lang: String, val addon: String) {
+    val language: String get() = Languages.name(lang)
+    val mimeType: String get() = url.substringBefore('?').lowercase().let {
+        when {
+            it.endsWith(".vtt") -> MimeTypes.TEXT_VTT
+            it.endsWith(".ass") || it.endsWith(".ssa") -> MimeTypes.TEXT_SSA
+            else -> MimeTypes.APPLICATION_SUBRIP
+        }
+    }
+}
+
+internal fun parseCastMember(name: String?, character: String? = null, photo: String? = null, role: String = "actor", tmdbId: Int? = null): CastMember? {
+    val cleanName = name?.trim()?.takeIf { it.isNotBlank() } ?: return null
+    return CastMember(cleanName, character?.trim()?.takeIf { it.isNotBlank() }, photo?.trim()?.takeIf { it.isNotBlank() })
+}
+
+class CastMember(
+    val name: String,
+    val character: String? = null,
+    val photo: String? = null,
+    val role: String = "actor",
+    val tmdbId: Int? = null,
+) {
+    val isDirector: Boolean get() = role == "director"
+    val initials: String get() {
+        val parts = name.trim().split(Regex("""\s+""")).filter {
+            it.isNotBlank() && it.lowercase().trimEnd('.') !in setOf("jr", "sr", "ii", "iii", "iv")
+        }.ifEmpty { name.trim().split(Regex("""\s+""")).filter { it.isNotBlank() } }
+        return when {
+            parts.isEmpty() -> ""
+            parts.size == 1 -> parts[0].take(1).uppercase()
+            else -> (parts.first().take(1) + parts.last().take(1)).uppercase()
+        }
+    }
+}
+
+class Video(val id: String, val title: String, val season: Int, val episode: Int, val thumbnail: String?,
+            val overview: String?, val released: String?, val runtime: String? = null)
+
+internal fun episodeNumber(season: Int, episode: Int): String? =
+    if (season >= 0 && episode > 0) "S$season E$episode" else null
+
+private val episodeLabelPattern = Regex("""S(\d+) E(\d+)""")
+
+internal fun parseEpisodeLabel(label: String): Pair<Int, Int>? {
+    val match = episodeLabelPattern.matchEntire(label) ?: return null
+    val season = match.groupValues[1].toIntOrNull() ?: return null
+    val episode = match.groupValues[2].toIntOrNull()?.takeIf { it > 0 } ?: return null
+    return season to episode
+}
+
+internal fun episodeNumbers(videoId: String?): Pair<Int, Int>? {
+    val parts = videoId?.split(':') ?: return null
+    if (parts.size != 3 || parts[0].isBlank()) return null
+    val season = parts[1].toIntOrNull() ?: return null
+    val episode = parts[2].toIntOrNull() ?: return null
+    return (season to episode).takeIf { season >= 0 && episode > 0 }
+}
+
+/**
+ * The IMDb id, season and episode IntroDB knows an episode by, or null when the show has no IMDb id.
+ * Anime metadata (AIOMetadata, for one) can list Kitsu or MAL episode ids ("kitsu:9965:1") under an IMDb show:
+ * then the show's id and the episode's season and number from the show's own [videos] stand in.
+ */
+internal fun introDbEpisode(metaId: String, videoId: String, videos: List<Video>?): Triple<String, Int, Int>? {
+    if (!metaId.startsWith("tt")) return null
+    val parts = videoId.split(':')
+    if (parts.size >= 3 && parts[0].startsWith("tt")) {
+        val (season, episode) = episodeNumbers(parts.take(3).joinToString(":")) ?: return null
+        return Triple(parts[0], season, episode)
+    }
+    val video = videos?.firstOrNull { it.id == videoId && it.season >= 0 && it.episode > 0 } ?: return null
+    return Triple(metaId, video.season, video.episode)
+}
+
+/**
+ * Whether a title has episodes. A type is only a word an add-on picks ("anime", "channel", "podcast"), so for any type
+ * but movie, series and live, the title's own videos decide, as stremio-core does.
+ */
+internal fun hasEpisodes(type: String, videos: List<Video>?) = when {
+    type == "series" -> true
+    type == "movie" || isLiveType(type) -> false
+    else -> !videos.isNullOrEmpty()
+}
+
+/**
+ * Stremio's subtitle extras, "videoSize=1234&filename=Show.S01E02.mkv", or "" when neither is known (a size of 0 is
+ * unknown). Encoded like a URL path part, so a space is %20, not +.
+ */
+internal fun subtitleExtras(filename: String?, size: Long): String = listOfNotNull(
+    "videoSize=$size".takeIf { size > 0 },
+    filename?.takeIf { it.isNotBlank() }?.let { "filename=" + java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") },
+).joinToString("&")
+
+/**
+ * A source ready to play: the link and headers the player reads, how long its first picture may take, and how to let it
+ * go. The player sees only this, so a torrent plays like a debrid link (see [Stream.open]).
+ */
+class Opened(
+    val url: String, val headers: Map<String, String>,
+    val startWait: Long? = null, val readTimeoutMs: Int = 8_000, val close: () -> Unit = {},
+)
+
+class Stream(
+    val title: String, val description: String, val url: String, val headers: Map<String, String>,
+    val size: Long, val filename: String?, val bingeGroup: String?,
+    val torrent: TorrentSource? = null,
+    // Languages the add-on tags structurally (the Stremio "languages" field), beyond what its names spell out. Some
+    // add-ons mark a source as a dub only here, so without this those dubs never reached the language modal.
+    private val taggedLanguages: Set<String> = emptySet(),
+) {
+    /**
+     * False for addon "actions" dressed up as streams, such as MyTrakt's "Mark Watched" (a 27 KB placeholder file).
+     * They're left out of the list and never picked. Unknown size counts as a video. The line was 50 MB, which also
+     * hid real short videos (a 7-minute cartoon, a 480p anime episode) with no reason given.
+     */
+    val isVideo get() = size == 0L || size >= 5L * 1024 * 1024
+
+    /**
+     * The addon's name for it on one line: "Torrentio (2160p)" becomes "Torrentio  ·  2160p". A debrid tag ("[RD+]")
+     * becomes the service's name at the end, as the player shows it: "Torrentio  ·  2160p  ·  Real-Debrid".
+     */
+    val label get() = title.lines().joinToString(" ") { it.trim() }.replace(debridTag, "").trim()
+        .replace(Regex("\\s*\\((.+?)\\)\\s*$"), "  ·  $1") + (debrid?.let { "  ·  ${it.name}" } ?: "")
+
+    /** The debrid service it comes through, null for a direct link. */
+    val debrid: Debrid? = if (torrent == null) debridOf(title, url) else null
+
+    /** Its link as the player gets it: at once for a link, through the engine for a torrent. Off the main thread. */
+    fun open(context: android.content.Context, episode: Pair<Int, Int>? = null): Opened =
+        torrent?.open(context, filename, episode) ?: Opened(url, headers)
+
+    /** True when [open] is instant (a link), so the player needn't wait for it on another thread. */
+    val opensAtOnce get() = torrent == null
+
+    /** Peers sharing it, as the add-on writes them ("👤 52"); null when it doesn't say. Matters only for P2P. */
+    val seeders: Int? = seedersIn("$title\n$description")
+
+    // What the release is, read from its file name and the addon's labels (AIOStreams writes "2160p", "DV", "HEVC"
+    // into them; the file name says it for every addon). ponytail: name matching, not the file's real tracks.
+    private val words = "$filename $title $description".lowercase()
+    val height = when {
+        Regex("2160|\\b4k\\b|\\buhd\\b").containsMatchIn(words) -> 2160
+        "1080" in words -> 1080
+        "720" in words -> 720
+        "576" in words -> 576
+        "480" in words -> 480
+        else -> 0
+    }
+    val isHdr get() = hdr || dolbyVision
+    /** Dolby Vision with no HDR10 base (profile 5, common on web releases): only a profile 5 decoder shows it right. */
+    val dolbyVisionOnly get() = dolbyVision && !hdr
+    val dolbyVision = Regex("\\b(dv|dovi|dolby.?vision)\\b").containsMatchIn(words)
+    val hdr = Regex("\\bhdr|\\bp8\\b|hybrid").containsMatchIn(words) // P8 and hybrid DV carry an HDR10 base
+    private val hevc = Regex("hevc|[xh].?265").containsMatchIn(words)
+    private val av1 = Regex("\\bav1\\b").containsMatchIn(words)
+
+    // The release type and extras, for Settings' stream preferences.
+    val remux = Regex("\\bremux\\b").containsMatchIn(words)
+    val bluray = !remux && Regex("blu.?ray|\\bbd.?rip|\\bbr.?rip").containsMatchIn(words)
+    val web = Regex("web.?(dl|rip)|\\bweb\\b").containsMatchIn(words)
+    /** Filmed in a cinema or a screener: never picked. */
+    val cam = Regex("\\b(cam|camrip|hdcam|ts|hdts|telesync|tc|telecine|scr|screener|dvdscr)\\b").containsMatchIn(words)
+    private val threeD = Regex("\\b3d\\b").containsMatchIn(words)
+    private val hardSubs = Regex("\\bhc\\b|hardcoded|hardsub").containsMatchIn(words)
+    /** 3D or subtitles burnt into the picture: picked last. */
+    val awkward get() = threeD || hardSubs
+    val trueHdAudio = "truehd" in words
+    val dtsHdAudio = Regex("dts.?hd").containsMatchIn(words)
+    val multiAudio = Regex("\\b(multi|dual)\\b").containsMatchIn(words)
+    val dubbed = Regex("\\bdub(bed)?\\b").containsMatchIn(words)
+    // The names without the languages they give for subtitles only, so "🎙️ 🇬🇧 💬 🇬🇧 🇳🇱" or "NL subs" isn't a Dutch dub.
+    private val spoken = withoutSubtitleLanguages(words)
+    /** The audio languages the names give, as two-letter codes; empty when they give none (see [audioLanguagesIn]). */
+    val audioLanguages = audioLanguagesIn(spoken) + taggedLanguages
+    /** Whether the names mention this language for the audio ("hindi" for "hi"). */
+    fun mentions(language: String) = language in audioLanguages ||
+        Locale.forLanguageTag(language).getDisplayLanguage(Locale.ENGLISH).lowercase().let { it.length > 2 && it in spoken }
+
+    /** Short tags for the source list: "REMUX · DV · Atmos". */
+    val tags get() = listOfNotNull(
+        "REMUX".takeIf { remux }, "BluRay".takeIf { bluray }, "WEB".takeIf { web && !remux && !bluray },
+        "DV".takeIf { dolbyVision }, "HDR".takeIf { hdr }, "Atmos".takeIf { "atmos" in words },
+        "TrueHD".takeIf { trueHdAudio }, "DTS-HD".takeIf { dtsHdAudio },
+        "Multi audio".takeIf { multiAudio }, "Dub".takeIf { dubbed }, "3D".takeIf { threeD }, "Hard subs".takeIf { hardSubs },
+    )
+
+    /**
+     * Whether this TV can decode it at all. Dolby Vision without an HDR10 base isn't left out here: many TVs report
+     * their Dolby Vision decoders in ways the check misses, so it's listed last instead (StreamsActivity.rank).
+     */
+    fun playableOn(tv: Device): Boolean = (!hevc || tv.hevc) && (!av1 || tv.av1)
+
+    /** How well it suits this TV, higher first: nothing above the screen's resolution, HDR only on an HDR screen. */
+    fun fit(tv: Device, displayHeight: Int): Int = (if (height > displayHeight) 0 else 2) +
+        (if ((hdr || dolbyVision) && !tv.hdr) -1 else 0)
+
+    fun toJson(): JSONObject = JSONObject().put("name", title).put("description", description).put("url", url)
+        .put("headers", JSONObject(headers)).put("size", size).put("filename", filename).put("binge", bingeGroup)
+        .put("languages", JSONArray(taggedLanguages.toList()))
+        .apply { torrent?.let { put("torrent", it.toJson()) } }
+
+    companion object {
+        fun from(json: JSONObject, allowTorrents: Boolean = false): Stream? {
+            val url = json.text("url")?.takeUnless(TorrentSource::isTorrentUrl)
+            val torrent = if (url == null && allowTorrents) TorrentSource.from(json) else null
+            if (url == null && torrent == null) return null
+            val hints = json.optJSONObject("behaviorHints")
+            val headers = hints?.optJSONObject("proxyHeaders")?.optJSONObject("request")
+            return Stream(
+                json.text("name") ?: "",
+                json.text("description") ?: json.text("title") ?: "",
+                url.orEmpty(),
+                if (torrent != null) emptyMap() else headers?.keys()?.asSequence()?.associateWith { headers.getString(it) }.orEmpty(),
+                // Torrentio and most others write the size only in their text ("💾 4.35 GB"), not in videoSize.
+                hints?.optLong("videoSize")?.takeIf { it > 0 } ?: sizeIn("${json.text("description") ?: json.text("title")}\n${json.text("name")}"),
+                hints?.text("filename"),
+                hints?.text("bingeGroup"),
+                torrent,
+                languageTagsIn(json),
+            )
+        }
+
+        /** Back from [toJson], for the player's list of sources to try. */
+        fun read(json: JSONObject): Stream {
+            val headers = json.optJSONObject("headers") ?: JSONObject()
+            return Stream(json.optString("name"), json.optString("description"), json.getString("url"),
+                headers.keys().asSequence().associateWith { headers.getString(it) }, json.optLong("size"),
+                json.text("filename"), json.text("binge"), json.optJSONObject("torrent")?.let(TorrentSource::from),
+                json.optJSONArray("languages")?.strings()?.toSet().orEmpty())
+        }
+    }
+}
+
+fun JSONArray?.items(): List<Any> = if (this == null) emptyList() else (0 until length()).map { get(it) }
+
+fun JSONArray?.objects(): List<JSONObject> = items().filterIsInstance<JSONObject>()
+
+/** A catalog's titles: one without an id is left out, not the whole row. */
+fun List<JSONObject>.metas(): List<Meta> = mapNotNull { runCatching { Meta(it) }.getOrNull() }
+
+fun JSONArray?.strings(): List<String> = items().filterIsInstance<String>()
+
+/** The string at [key], or null when it's missing, JSON null or blank (optString would return "null" for JSON null). */
+/** "147 min" reads "2h 27m" as on the mock; under an hour, and anything not in minutes, stays as the addon wrote it. */
+/**
+ * The languages an add-on tags a stream with structurally (the Stremio "languages" field), as two-letter codes.
+ * Some add-ons mark a dub only here, never in the text, so these must feed [Stream.audioLanguages] too.
+ */
+internal fun languageTagsIn(json: JSONObject): Set<String> {
+    val arr = json.optJSONArray("languages") ?: return emptySet()
+    val out = mutableSetOf<String>()
+    for (i in 0 until arr.length()) {
+        val raw = arr.optString(i).trim().lowercase()
+        if (raw.isEmpty()) continue
+        val primary = raw.split('-', '_').firstOrNull().orEmpty()
+        val code = runCatching { java.util.Locale.forLanguageTag(raw).language }.getOrNull()
+            ?.takeIf { it.isNotBlank() && it != "und" }
+            ?: primary.takeIf { it.length in 2..3 && it != "und" && it != "zxx" }
+        if (!code.isNullOrBlank() && code != "und" && code != "zxx") out.add(code)
+    }
+    return out
+}
+
+/**
+ * Audio languages, as two-letter codes, from a stream's names: Torrentio's flags (🇮🇹), AIOStreams' "English | Hindi",
+ * and file-name tags (ITA, HINDI, TRUEFRENCH). ponytail: names only, not the file's real tracks; most English releases
+ * name no language at all, so an empty set usually means English.
+ */
+internal fun audioLanguagesIn(text: String): Set<String> {
+    val found = mutableSetOf<String>()
+    // Regional indicators: two in a row make a country's flag, read in pairs so 🇺🇸🇪🇸 isn't also "SE".
+    // By hand: String.codePoints() needs Android 7.
+    val letters = buildList {
+        var at = 0
+        while (at < text.length) text.codePointAt(at).let { add(it - 0x1F1E6); at += Character.charCount(it) }
+    }
+    var i = 0
+    while (i < letters.size - 1) {
+        if (letters[i] in 0..25 && letters[i + 1] in 0..25) {
+            flagLanguages["${'a' + letters[i]}${'a' + letters[i + 1]}"]?.let(found::add)
+            i += 2
+        } else i++
+    }
+    Regex("[a-z]+").findAll(text.lowercase()).forEach { m -> languageWords[m.value]?.let(found::add) }
+    return found
+}
+
+/**
+ * [text] without the languages it names for subtitles only: the flags after 💬, as StremThru writes them
+ * ("🎙️ 🇬🇧 💬 🇬🇧 🇳🇱 🇫🇷"), and tags such as "NL subs", "NLSubs" or "Subs ENG". What's left speaks for the audio.
+ */
+internal fun withoutSubtitleLanguages(text: String): String {
+    // Strip "Subs <lang, ...>" before "<lang> subs" so "Audio: English Subtitles: Dutch" and "ENG.Subs.NL" keep English.
+    val withoutPrefix = subtitlePrefixTags.replace(text.replace(subtitleFlags, " ")) { m ->
+        val wordsAfter = Regex("[a-z]+").findAll(m.value.lowercase()).drop(1).toList()
+        val firstNonLang = wordsAfter.firstOrNull { it.value !in languageWords }
+        when {
+            wordsAfter.isEmpty() || wordsAfter.first().value !in languageWords -> m.value
+            firstNonLang == null -> " "
+            else -> " " + m.value.substring(firstNonLang.range.first)
+        }
+    }
+    return subtitleSuffixTags.replace(withoutPrefix) { m ->
+        if (m.groupValues[1].lowercase() in languageWords) " " else m.value
+    }
+}
+
+private val subtitleFlags = Regex("\\x{1F4AC}\\x{FE0F}?(?:\\s*(?:[\\x{1F1E6}-\\x{1F1FF}]{2}|\\x{1F3F3}\\x{FE0F}?))*")
+private val subtitlePrefixTags = Regex("(?i)\\b(?:subs?|subtitles?)[ ._:-]+\\p{L}+(?:[ ._,/|&:-]+\\p{L}+)*\\b")
+private val subtitleSuffixTags = Regex("(?i)\\b(\\p{L}+?)[ ._-]?(?:subs?|subtitles?|subbed)\\b")
+
+private val flagLanguages = mapOf("gb" to "en", "us" to "en", "au" to "en", "it" to "it", "in" to "hi", "es" to "es",
+    "mx" to "es", "fr" to "fr", "de" to "de", "pt" to "pt", "br" to "pt", "ru" to "ru", "jp" to "ja", "kr" to "ko",
+    "cn" to "zh", "tw" to "zh", "hk" to "zh", "nl" to "nl", "pl" to "pl", "tr" to "tr", "se" to "sv", "dk" to "da",
+    "no" to "no", "fi" to "fi", "gr" to "el", "il" to "he", "sa" to "ar", "ae" to "ar", "eg" to "ar", "th" to "th",
+    "vn" to "vi", "id" to "id", "ua" to "uk", "cz" to "cs", "hu" to "hu", "ro" to "ro", "ir" to "fa", "pk" to "ur", "bd" to "bn")
+
+// English names and the release tags that stand for a language. Short tags that are also common words ("por", "mal")
+// are left out.
+private val languageWords = mapOf("english" to "en", "eng" to "en", "hindi" to "hi", "hin" to "hi", "italian" to "it",
+    "ita" to "it", "spanish" to "es", "spa" to "es", "esp" to "es", "latino" to "es", "castellano" to "es",
+    "french" to "fr", "fre" to "fr", "fra" to "fr", "vff" to "fr", "truefrench" to "fr", "german" to "de", "ger" to "de",
+    "deu" to "de", "portuguese" to "pt", "russian" to "ru", "rus" to "ru", "japanese" to "ja", "jpn" to "ja",
+    "korean" to "ko", "kor" to "ko", "chinese" to "zh", "mandarin" to "zh", "cantonese" to "zh", "dutch" to "nl",
+    // Dutch releases: "NL Gesproken", "100%NL", "NLD", Flemish ("Vlaams"); "NL subs" is taken out first.
+    "nl" to "nl", "nld" to "nl", "dut" to "nl", "nederlands" to "nl", "vlaams" to "nl", "flemish" to "nl",
+    "polish" to "pl", "turkish" to "tr", "swedish" to "sv", "danish" to "da", "norwegian" to "no", "finnish" to "fi",
+    "greek" to "el", "hebrew" to "he", "arabic" to "ar", "thai" to "th", "vietnamese" to "vi", "indonesian" to "id",
+    "ukrainian" to "uk", "czech" to "cs", "hungarian" to "hu", "romanian" to "ro", "persian" to "fa", "urdu" to "ur",
+    "bengali" to "bn", "tamil" to "ta", "tam" to "ta", "telugu" to "te", "tel" to "te", "malayalam" to "ml",
+    "kannada" to "kn", "marathi" to "mr",
+    // The rest of Moviebox's dub/lanName set (Moviebox.LANGS): every language it can label a dub with must parse here,
+    // or that dub never shows in the language modal and is ranked as if it named no language.
+    "gujarati" to "gu", "guj" to "gu", "punjabi" to "pa", "pan" to "pa", "odia" to "or", "oriya" to "or", "ori" to "or",
+    "assamese" to "as", "asm" to "as", "nepali" to "ne", "nep" to "ne", "sinhala" to "si", "sinhalese" to "si", "sin" to "si",
+    "burmese" to "my", "mya" to "my", "khmer" to "km", "khm" to "km", "lao" to "lo", "tibetan" to "bo", "bod" to "bo",
+    "dzongkha" to "dz", "dzo" to "dz", "malay" to "ms", "msa" to "ms", "melayu" to "ms",
+    "filipino" to "tl", "tagalog" to "tl", "tgl" to "tl", "javanese" to "jv", "jav" to "jv",
+    "slovak" to "sk", "slovakian" to "sk", "bulgarian" to "bg", "serbian" to "sr", "croatian" to "hr",
+    "slovenian" to "sl", "slovene" to "sl", "icelandic" to "is", "estonian" to "et", "latvian" to "lv",
+    "lithuanian" to "lt", "albanian" to "sq", "macedonian" to "mk", "georgian" to "ka", "armenian" to "hy",
+    "azerbaijani" to "az", "kazakh" to "kk", "uzbek" to "uz", "mongolian" to "mn", "swahili" to "sw",
+    "afrikaans" to "af", "amharic" to "am", "hausa" to "ha", "yoruba" to "yo", "zulu" to "zu",
+    "catalan" to "ca", "basque" to "eu", "galician" to "gl", "pashto" to "ps", "pushto" to "ps", "kurdish" to "ku",
+    "farsi" to "fa")
+
+/** A debrid service ([short] as add-ons tag it, "RD"); [cached]: ready to start at once, null when the add-on doesn't say. */
+class Debrid(val name: String, val short: String, val cached: Boolean?) {
+    /** The source list's tag: "RD ⚡" when cached (starts at once), "RD ⏳" when the service must download it first. */
+    val tag get() = when (cached) { true -> "$short ⚡"; false -> "$short ⏳"; null -> short }
+}
+
+private val sizeText = Regex("(\\d+(?:[.,]\\d+)?)\\s*(GB|GiB|MB|MiB)\\b(?!/)", RegexOption.IGNORE_CASE)
+
+/** A file size from an add-on's text, the one after 💾 first: "💾 4.35 GB" is 4_350_000_000. 0 when none. */
+internal fun sizeIn(text: String): Long {
+    val m = text.substringAfter("💾", "").let(sizeText::find) ?: sizeText.find(text) ?: return 0
+    val n = m.groupValues[1].replace(',', '.').toDoubleOrNull() ?: return 0
+    return (n * if (m.groupValues[2].startsWith("G", ignoreCase = true)) 1e9 else 1e6).toLong()
+}
+
+/** Seeders from an add-on's text: Torrentio writes "👤 52", others "👥 52". */
+internal fun seedersIn(text: String): Int? = Regex("(?:👤|👥)\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull()
+
+/** The audio as a viewer reads it: "Atmos 7.1", "DD+ 5.1", "AAC 2.0"; null when the names don't say. */
+internal fun audioSummary(words: String): String? {
+    val format = when {
+        "atmos" in words -> "Atmos"
+        "truehd" in words -> "TrueHD"
+        Regex("dts.?x\\b").containsMatchIn(words) -> "DTS:X"
+        Regex("dts.?hd").containsMatchIn(words) -> "DTS-HD"
+        Regex("\\bdts").containsMatchIn(words) -> "DTS"
+        Regex("\\b(ddp|dd\\+|e-?ac-?3)").containsMatchIn(words) -> "DD+"
+        Regex("\\b(dd|ac-?3)(?![a-z])").containsMatchIn(words) -> "DD"
+        Regex("\\baac").containsMatchIn(words) -> "AAC"
+        Regex("\\bflac").containsMatchIn(words) -> "FLAC"
+        Regex("\\bopus\\b").containsMatchIn(words) -> "Opus"
+        else -> null
+    }
+    val channels = Regex("(?<!\\d)([1257])[ ._]([01])(?![\\d])").find(words)?.let { "${it.groupValues[1]}.${it.groupValues[2]}" }
+        ?: "2.0".takeIf { "stereo" in words } ?: "Mono".takeIf { Regex("\\bmono\\b").containsMatchIn(words) }
+    return listOfNotNull(format, channels).joinToString(" ").ifEmpty { null }
+}
+
+private val debridServices = listOf(
+    Triple("RD", "Real-Debrid", listOf("real-debrid", "realdebrid", "rdeb.io")),
+    Triple("AD", "AllDebrid", listOf("alldebrid", "debrid.it")),
+    Triple("PM", "Premiumize", listOf("premiumize", "energycdn")),
+    Triple("TB", "TorBox", listOf("torbox", "tb-cdn")),
+    Triple("DL", "Debrid-Link", listOf("debrid-link", "debridlink")),
+    Triple("ED", "EasyDebrid", listOf("easydebrid")),
+    Triple("OC", "Offcloud", listOf("offcloud")),
+    Triple("PIO", "Put.io", listOf("put.io", "putio")),
+)
+
+// Add-ons' tags: Torrentio "[RD+]" (cached) and "[RD download]", AIOStreams and Comet "[RD⚡]" and "[RD⏳]",
+// MediaFusion "⚡RD". The code must stand alone, so "[RDX]" or "HDR" isn't one.
+private val debridCodes = debridServices.joinToString("|") { it.first }
+private val debridTag = Regex("\\[($debridCodes)\\s*(\\+|⚡️?|⏳|download)?]\\s*", RegexOption.IGNORE_CASE)
+private val debridFlash = Regex("(⚡️?)\\s*($debridCodes)\\b")
+
+/**
+ * The debrid service from a source's name, else from its link (Torrentio's /resolve/realdebrid/…, or the service's
+ * own download host). Null for a direct link or a service it doesn't know.
+ */
+internal fun debridOf(name: String, url: String): Debrid? {
+    fun service(code: String) = debridServices.first { it.first.equals(code, ignoreCase = true) }
+    debridTag.find(name)?.let { m ->
+        val mark = m.groupValues[2].lowercase()
+        val cached = when { mark == "+" || mark.startsWith("⚡") -> true; mark == "⏳" || mark == "download" -> false; else -> null }
+        return service(m.groupValues[1]).let { Debrid(it.second, it.first, cached) }
+    }
+    debridFlash.find(name)?.let { m -> return service(m.groupValues[2]).let { Debrid(it.second, it.first, true) } }
+    val link = url.lowercase()
+    return debridServices.firstOrNull { (_, _, hosts) -> hosts.any { it in link } }?.let { Debrid(it.second, it.first, null) }
+}
+
+internal fun runtime(text: String): String {
+    // "147 min", or "2h35min" / "2h 35m" as some addons write it.
+    val hm = Regex("""^(\d+)\s*h\s*(\d+)\s*m(in)?$""").find(text.trim())?.groupValues
+    val minutes = hm?.let { it[1].toInt() * 60 + it[2].toInt() }
+        ?: Regex("""^(\d+)\s*min""").find(text.trim())?.groupValues?.get(1)?.toIntOrNull() ?: return text
+    return if (minutes < 60) "$minutes min" else "${minutes / 60}h %02dm".format(minutes % 60)
+}
+
+fun JSONObject.text(key: String): String? = if (isNull(key)) null else optString(key).ifBlank { null }
+
+/**
+ * An add-on's `/configure` page with its settings left out of the address: the path parts that hold them (Torrentio's
+ * "providers=…|realdebrid=KEY", AIOStreams' long encoded blob) go, and the rest of the path stays. ponytail: a guess by
+ * shape (`=`, `|`, `%`, `,` or 24+ characters); an add-on with a short plain key in its path would still show it.
+ */
+internal fun freshConfigureUrl(base: String): String {
+    val start = base.indexOf("://").let { if (it < 0) 0 else it + 3 }
+    val slash = base.indexOf('/', start).let { if (it < 0) base.length else it }
+    val path = base.substring(slash).split('/').filter { seg -> seg.isNotEmpty() && seg.length < 24 && seg.none { it in "=|%," } }
+    return base.substring(0, slash) + path.joinToString("") { "/$it" } + "/configure"
+}
+
+/** Direct playable trailer URLs from a metadata add-on's `trailerStreams`. */
+internal fun parseTrailerStreams(json: JSONObject): List<Stream> =
+    json.optJSONArray("trailerStreams")?.objects()?.mapNotNull { item ->
+        val url = item.text("url") ?: return@mapNotNull null
+        val title = item.text("title")?.takeIf { it.isNotBlank() } ?: "Trailer"
+        Stream(title, "", url, emptyMap(), 0L, null, null)
+    }.orEmpty()
+
+/** The official YouTube trailer ID from `trailerStreams` or `trailers` (Cinemeta and AIOMetadata). */
+internal fun parseTrailerYtId(json: JSONObject): String? =
+    json.optJSONArray("trailerStreams")?.objects()?.firstNotNullOfOrNull { it.text("ytId") }
+        ?: json.optJSONArray("trailers")?.objects()
+            ?.sortedBy { if (it.text("type").equals("Trailer", ignoreCase = true)) 0 else 1 }
+            ?.firstNotNullOfOrNull { it.text("source") ?: it.text("ytId") }
+
+internal fun trailerNodePriority(type: String, name: String): Int = when {
+    type.equals("Trailer", ignoreCase = true) -> 0
+    name.contains("trailer", ignoreCase = true) -> 1
+    else -> 2
+}
+
+internal fun orderTrailerStreams(videoTitle: String, playbackUrls: List<Pair<String, String>>): List<Stream> {
+    val title = videoTitle.ifBlank { "Trailer" }
+    val rankOrder = listOf("1080p", "auto", "720p", "480p", "sd")
+    return playbackUrls
+        .filter { it.second.isNotBlank() }
+        .sortedBy { (quality, _) ->
+            rankOrder.indexOf(quality.lowercase()).let { if (it >= 0) it else rankOrder.size }
+        }
+        .distinctBy { it.second }
+        .map { (quality, url) ->
+            val label = if (quality.isNotBlank() && !quality.equals("AUTO", ignoreCase = true)) "$title ($quality)" else title
+            Stream(label, quality, url, emptyMap(), 0L, null, null)
+        }
+}
+
+/** The US content rating ("R", "TV-MA") from IMDb's `certificate` response, or null when IMDb has none. */
+internal fun parseImdbCertificate(json: JSONObject): String? =
+    json.optJSONObject("data")?.optJSONObject("title")?.optJSONObject("certificate")?.text("rating")
+        ?.trim()?.takeIf { it.isNotBlank() }
+
+private val imdbCertificateCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+internal fun imdbCertificate(imdbId: String): String? {
+    if (!imdbId.startsWith("tt")) return null
+    imdbCertificateCache[imdbId]?.let { return it }
+    return runCatching {
+        val query = JSONObject().put("query", "{title(id:\"$imdbId\"){certificate{rating}}}").toString()
+        val raw = Http.post(
+            "https://api.graphql.imdb.com/",
+            query,
+            timeoutMs = 5_000,
+            headers = mapOf("x-imdb-client-name" to "imdb-web-next-localized")
+        )
+        parseImdbCertificate(JSONObject(raw))?.also { imdbCertificateCache[imdbId] = it }
+    }.getOrNull()
+}
+
+/**
+ * Direct MP4 and HLS trailer streams from IMDb's `primaryVideos` response, preferring official trailers over clips and
+ * ordering stream qualities from 1080p and adaptive HLS down to SD so ExoPlayer can fall back if one fails.
+ */
+internal fun parseImdbTrailerStreams(json: JSONObject): List<Stream> {
+    val edges = json.optJSONObject("data")?.optJSONObject("title")
+        ?.optJSONObject("primaryVideos")?.optJSONArray("edges")?.objects().orEmpty()
+    val nodes = edges.mapNotNull { it.optJSONObject("node") }.filter { node ->
+        node.optJSONArray("playbackURLs")?.objects()?.any { it.text("url") != null } == true
+    }
+    val bestNode = nodes.minByOrNull { node ->
+        val type = node.optJSONObject("contentType")?.optJSONObject("displayName")?.text("value").orEmpty()
+        val name = node.optJSONObject("name")?.text("value").orEmpty()
+        trailerNodePriority(type, name)
+    } ?: return emptyList()
+    val videoTitle = bestNode.optJSONObject("name")?.text("value") ?: "Trailer"
+    val urls = bestNode.optJSONArray("playbackURLs")?.objects().orEmpty()
+        .mapNotNull { u ->
+            val url = u.text("url") ?: return@mapNotNull null
+            val quality = u.optJSONObject("displayName")?.text("value")
+                ?: u.text("videoMimeType") ?: ""
+            quality to url
+        }
+    return orderTrailerStreams(videoTitle, urls)
+}
+
+private val imdbTrailerCache = java.util.concurrent.ConcurrentHashMap<String, List<Stream>>()
+
+internal fun imdbTrailerStreams(imdbId: String): List<Stream> {
+    if (!imdbId.startsWith("tt")) return emptyList()
+    imdbTrailerCache[imdbId]?.let { return it }
+    return runCatching {
+        val query = JSONObject().put(
+            "query",
+            "{title(id:\"$imdbId\"){primaryVideos(first:5){edges{node{id name{value}contentType{displayName{value}}playbackURLs{displayName{value}url videoMimeType}}}}}}"
+        ).toString()
+        val raw = Http.post(
+            "https://api.graphql.imdb.com/",
+            query,
+            timeoutMs = 5_000,
+            headers = mapOf("x-imdb-client-name" to "imdb-web-next-localized")
+        )
+        parseImdbTrailerStreams(JSONObject(raw)).also { imdbTrailerCache[imdbId] = it }
+    }.getOrDefault(emptyList())
+}
+

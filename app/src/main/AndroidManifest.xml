@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- Alder only loads the torrent engine on API 24 and later. -->
+    <uses-sdk tools:overrideLibrary="com.nuvio.engine" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Continue Watching on the Google TV home (WatchNext.kt) -->
+    <uses-permission android:name="com.android.providers.tv.permission.WRITE_EPG_DATA" />
+    <!-- Background playback: keep the sound going after the viewer leaves, with a lock-screen notification (PlaybackService) -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <uses-feature android:name="android.software.leanback" android:required="false" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+
+    <queries>
+        <intent><action android:name="android.speech.action.RECOGNIZE_SPEECH" /></intent>
+        <!-- Settings › Video player lists the video apps on this TV (Android 11+ hides other apps without this). -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" android:mimeType="video/*" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:banner="@drawable/banner"
+        android:icon="@drawable/logo"
+        android:theme="@style/Alder"
+        android:localeConfig="@xml/locales_config"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:usesCleartextTraffic="true"
+        android:enableOnBackInvokedCallback="false">
+        <!-- Plain http:// as Stremio allows it: self-hosted add-ons (http://192.168.…:7000), debrid proxies and IPTV
+             links. Android 9+ blocks it otherwise, and every such add-on and stream failed. -->
+        <!-- Back as a key press on Android 16 too: the player and its panels read KEYCODE_BACK, which Android 16 stops
+             sending to apps that target it, so Back left the player with the controls or a panel up. Screen.kt also
+             registers a back callback that sends the same key press, for Android 16 and for a phone's back gesture. -->
+
+        <activity
+            android:name=".ProfilesActivity"
+            android:exported="true"
+            android:screenOrientation="unspecified">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+            <!-- Opened from a Stremio or magnet link, or a shared title. Kept separate from the http(s)
+                 filter below: a filter that lists an authority rejects any scheme-only URI (stremio:, magnet:). -->
+            <intent-filter android:label="Open in Alder">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="stremio" />
+                <data android:scheme="magnet" />
+            </intent-filter>
+            <!-- A link to Stremio opened in a browser (strem.io pages, share links). -->
+            <intent-filter android:label="Open in Alder">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" android:host="strem.io" />
+                <data android:scheme="http" android:host="www.strem.io" />
+                <data android:scheme="https" android:host="strem.io" />
+                <data android:scheme="https" android:host="www.strem.io" />
+            </intent-filter>
+            <!-- Shared into Alder (a Stremio or magnet link sent as text). -->
+            <intent-filter android:label="Share to Alder">
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".MainActivity" android:screenOrientation="unspecified" />
+        <activity android:name=".SearchActivity" android:screenOrientation="unspecified" />
+        <activity android:name=".SettingsActivity" android:screenOrientation="unspecified" />
+        <activity android:name=".AddonsActivity" android:screenOrientation="unspecified" />
+        <activity android:name=".DetailsActivity" android:screenOrientation="unspecified" />
+        <!-- See-through so the player under it (Change stream) is only paused, not stopped: a stopped player loses its
+             picture until Play. No fixed orientation: Android 8.0 refuses one on a see-through screen. -->
+        <activity android:name=".StreamsActivity" android:theme="@style/Alder.Over" />
+        <activity
+            android:name=".PlayerActivity"
+            android:theme="@style/Alder.Player"
+            android:screenOrientation="sensorLandscape"
+            android:supportsPictureInPicture="true"
+            android:configChanges="keyboard|keyboardHidden|navigation|screenSize|smallestScreenSize|screenLayout|orientation" />
+        <service
+            android:name=".PlaybackService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+    </application>
+</manifest>
