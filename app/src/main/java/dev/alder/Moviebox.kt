@@ -134,7 +134,7 @@ object Moviebox {
     private class CacheEntry(val at: Long, val resolved: MBResolved)
     private data class MBMember(val subjectId: String, val detailPath: String, val lanName: String?)
     private class MBSubjectMatch(val family: List<MBMember>, val originalId: String, val title: String)
-    private class MBSubjectHit(val score: Int, val hitId: String, val slug: String, val subject: JSONObject)
+    private class MBSubjectHit(val score: Int, val hitId: String, val slug: String, val hitName: String, val subject: JSONObject)
     private data class MBSource(val height: Int, val codecs: List<String>, val url: String)
     private data class MBSubtitle(val id: String, val lan: String, val lang: String, val label: String, val url: String)
     private class MBVariant(
@@ -160,18 +160,6 @@ object Moviebox {
         "AV1" -> 2
         "VP9" -> 3
         else -> 4
-    }
-
-    // Union of two subjects' sources for one language: de-dupe by (height, codecs) and order highest-first with HEVC
-    // before H264/AV1 at the same height, so the player's first row is the best quality that language offers.
-    private fun mergeSources(a: List<MBSource>, b: List<MBSource>): List<MBSource> {
-        val seen = HashSet<String>()
-        val out = ArrayList<MBSource>()
-        for (s in a + b) {
-            if (s.height <= 0) continue
-            if (seen.add("${s.height}|${s.codecs.joinToString(",")}")) out.add(s)
-        }
-        return out.sortedWith(compareByDescending<MBSource> { it.height }.thenBy { codecRank(it.codecs.firstOrNull().orEmpty()) })
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
@@ -403,7 +391,7 @@ object Moviebox {
             val score = (if (year != null && y != null) (if (year == y) 3 else 1) else 0) +
                 (if (hasDubSuffix(hit.text("name"))) 0 else 1) -
                 (if (isLoose.contains(hitId)) 2 else 0) + seasonBonus
-            if (best == null || score > best!!.score) best = MBSubjectHit(score, hitId, slug, subject)
+            if (best == null || score > best!!.score) best = MBSubjectHit(score, hitId, slug, hit.text("name") ?: "", subject)
             if (score >= 4) break
         }
         if (best == null && searchError != null && !searchWorked) throw searchError!!
@@ -430,15 +418,12 @@ object Moviebox {
                 family.add(MBMember(id, i.text("slug") ?: id, label))
             }
         }
-        // The original audio is the family member that is NOT a named dub: a null/blank lanName or one that reads
-        // "Original"/"Original Audio". Identifying it by the detail name's dub suffix was unreliable (Moviebox stores
-        // the base name there, so a dub subject looked unsuffixed and stole the original flag — which relabelled that
-        // dub's streams as "Original" and hid both it and the true original behind one entry).
-        val originalId = family.firstOrNull { m ->
-            val n = m.lanName?.replace(DUB_WORD, "")?.trim().orEmpty()
-            m.lanName == null || n.isEmpty() || n.equals("original", ignoreCase = true) ||
-                n.equals("original audio", ignoreCase = true)
-        }?.subjectId ?: family.firstOrNull()?.subjectId ?: self.subjectId
+        // The un-suffixed subject is the original audio.
+        val originalId = if (hasDubSuffix(found.hitName)) {
+            family.firstOrNull()?.subjectId ?: self.subjectId
+        } else {
+            self.subjectId
+        }
         return MBSubjectMatch(family.take(MAX_DUBS), originalId, found.subject.text("title") ?: name)
     }
 
@@ -469,12 +454,10 @@ object Moviebox {
         // vodnik's mapper only serves an asset when a matching MP4 release exists at (resolution, codec); a DASH-only
         // source has none, so track which (height, codec) pairs have an MP4 sibling before rewriting to /hls/...-MP4.
         val mp4Keys = HashSet<String>()
-        val mp4Proxied = HashMap<String, String>()
         for (s in sources) {
             if (s.optString("format").uppercase() == "MP4" && s.optString("url").isNotEmpty()) {
                 val key = "${heightOf(s)}-${codecOf(s)}"
                 mp4Keys.add(key)
-                mp4Proxied[key] = mediaProxyUrl(s.optString("url"), id, se, ep, s.optJSONObject("headers"))
             }
         }
         val byHeight = LinkedHashMap<Int, MutableList<Triple<String, String, String>>>()
@@ -488,11 +471,8 @@ object Moviebox {
             var playUrl: String? = null
             when {
                 format == "MP4" || format.isEmpty() ->
-                    // Route every MP4 (HEVC and AVC) through the /media proxy as a progressive file. vodnik's on-demand
-                    // HLS muxes audio into the video fMP4 (hls_mux_audio), and ExoPlayer's chunkless preparation drops
-                    // that muxed audio track (androidx/media #3485), leaving a silent video. The progressive MP4 keeps
-                    // both tracks and ExoPlayer demuxes it normally.
-                    playUrl = mediaProxyUrl(url, id, se, ep, s.optJSONObject("headers"))
+                    if (isHevc(codec)) playUrl = vodnikUrl(id, se, ep, h, codec)
+                    else playUrl = mediaProxyUrl(url, id, se, ep, s.optJSONObject("headers"))
                 format == "HLS" || M3U8.containsMatchIn(url) ->
                     playUrl = mediaProxyUrl(url, id, se, ep, s.optJSONObject("headers"))
                 format == "DASH" && s.optString("dash_url").startsWith("/") ->
@@ -501,10 +481,7 @@ object Moviebox {
             if (playUrl == null) continue
             var finalPlayUrl = playUrl
             if (format == "DASH" && isHevc(codec) && mp4Keys.contains("$h-$codec")) {
-                // Prefer the audio-safe progressive MP4 (proxied) over vodnik's on-demand HLS: that HLS muxes audio
-                // into the video fMP4 and ExoPlayer's chunkless preparation drops it, leaving a silent picture
-                // (androidx/media #3485). The MP4 sibling keeps both tracks.
-                finalPlayUrl = mp4Proxied["$h-$codec"] ?: vodnikUrl(id, se, ep, h, codec)
+                finalPlayUrl = vodnikUrl(id, se, ep, h, codec)
             }
             val entry = byHeight.getOrPut(h) { ArrayList() }
             if (entry.none { it.first == codec && it.second == finalPlayUrl }) {
@@ -566,34 +543,6 @@ object Moviebox {
         android.util.Log.i("AlderStreams", "variants(pre-merge): " + variants.joinToString(" | ") {
             "orig=${it.original} lang=${it.lang} label='${it.label}' heights=[${it.sources.map { s -> s.height }.distinct().joinToString(",")}]"
         })
-
-        // A title's dubs are spread across several Moviebox subjects, and the same audio language can appear on more
-        // than one (two "Hindi" subjects, an English-tagged release separate from the untagged original). Collapse
-        // them to ONE variant per language, merging every subject's sources so each language plays at the best quality
-        // any of them offers: the original is often only a 480p placeholder while a 1080p release of the same film
-        // sits on another subject. The original/untagged audio is treated as English, so an English-tagged release
-        // folds into it and English plays at its best resolution too.
-        val merged = LinkedHashMap<String, MBVariant>()
-        for (v in variants) {
-            val key = when {
-                v.original -> "eng"
-                v.lang == "und" || v.lang.isEmpty() -> "und"
-                else -> v.lang
-            }
-            val existing = merged[key]
-            if (existing == null) {
-                merged[key] = v
-            } else {
-                existing.sources = mergeSources(existing.sources, v.sources)
-                existing.url = existing.sources.firstOrNull()?.url ?: existing.url
-                existing.original = existing.original || v.original
-                val have = HashSet(existing.subtitles.map { it.lan.lowercase() })
-                for (t in v.subtitles) if (have.add(t.lan.lowercase())) existing.subtitles.add(t)
-            }
-        }
-        val mergedVariants = ArrayList(merged.values)
-        variants.clear()
-        variants.addAll(mergedVariants)
 
         // Original audio first; it is what plays unless the viewer's audio preference matches a dub.
         variants.sortByDescending { if (it.original) 1 else 0 }

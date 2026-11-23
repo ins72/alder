@@ -613,6 +613,10 @@ class PlayerActivity : Screen() {
             setPadding(dp(22), dp(12), dp(22), dp(12))
             background = glass(10)
             visibility = View.GONE
+            setOnClickListener {
+                (tag as? IntroSegment)?.takeIf { canSeek() }?.let { player.seekTo(it.endMs) }
+                visibility = View.GONE
+            }
         }
         if (!isTrailer) fetchSegments()
         options = FrameLayout(this).apply { visibility = View.GONE }

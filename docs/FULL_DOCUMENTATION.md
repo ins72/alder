@@ -89,11 +89,16 @@ Devices in the dev environment: `emulator-5554` (MuMu, hevc=true av1=false), `em
 
 ### Discovery & data
 - **`Moviebox.kt`** — Moviebox/House resolver **and** add-on (`MovieboxAddon` id "moviebox",
-  `HouseAddon` id `org.local.streamimdb`, hidden from the add-ons list). Searches Moviebox, groups
-  one subject per **dub language** (`bingeGroup="MBDUB_<subjectId>"`), reads sources
-  (HEVC/h264 MP4 via HLS/`/media`, DASH via same-origin proxy), subtitles (WebVTT), and builds
-  `Stream`s with audio languages. Manifest names use `internalSourceName()`; stream titles/descriptions
-  use `"<brand> · …"`. Spanish/`esla` and "no playable stream" variants are dropped with a logged reason.
+  `HouseAddon` id `org.local.streamimdb`, hidden from the add-ons list). A port of
+  stremio-web-with-streamgrabber's `movieboxResolver.js` so Alder resolves streams directly
+  (no bridge, no server): searches Moviebox via Cinemeta + `/api/search` + `/api/detail`, builds
+  one variant per family member (original first, then each dub), one `Stream` per height per
+  variant. MP4+HEVC → vodnik on-demand HLS (`/hls/<id>-<se>-<ep>-<h>-hevc-MP4/master.m3u8`);
+  h264 MP4 → `/media` proxy (injects CDN User-Agent/Referer/Cookie); HLS → `/media`; DASH →
+  same-origin `/api/dash` proxy (DASH+HEVC rewrites to vodnik when an MP4 sibling exists).
+  `originalId` detected via `hasDubSuffix()` on the search hit's name; no cross-variant merging
+  — each family member is its own variant with subtitle sharing across them. `Stream.headers`
+  is `emptyMap()` (headers baked into the media-proxy URL query params).
 - **`Addon.kt`** — add-on/stream/subtitle/video/meta models; language detection
   (`audioLanguagesIn`, `LANG_FULL_NAMES`, flag/tag parsing); episode labels (`S..E..`), `episodeNumber`,
   `hasEpisodes`, `parseTrailerStreams`.
@@ -141,7 +146,8 @@ Devices in the dev environment: `emulator-5554` (MuMu, hevc=true av1=false), `em
    the rest, each best quality first, so a slow or failed link gives way to the next one in the same
    language), next-episode, PiP, external player, MediaSession hand-off,
   watch-slice + error + upgrade-shown reporting. The info button opens `DetailsActivity` **without**
-  finishing the player, so Back returns to it.
+  finishing the player, so Back returns to it. Skip-intro pill: D-pad OK/ENTER jumps past it, and
+  tapping the pill (touch) seeks to `IntroSegment.endMs` and hides it.
 - **Audio language choice & fallback** (`PlayerActivity`): the starting audio is the explicit Settings
   language (`Settings.audioLanguageExplicit`) if set, else this title's remembered audio, else the
   locale language. A source whose own audio can't be decoded is handled in stages before the language
