@@ -648,12 +648,12 @@ object MovieboxDirect {
     }
 
     // ── Main entry: streams ──────────────────────────────────────────────────────
-    fun streams(context: Context, type: String, videoId: String): List<Stream> {
+    fun streams(context: Context, type: String, videoId: String, titleOverride: String? = null): List<Stream> {
         val identity = generateClientIdentity()
         val out = mutableListOf<Stream>()
         val seenUrls = mutableSetOf<String>()
 
-        android.util.Log.i("AlderMovieboxDirect", "streams type=$type videoId=$videoId")
+        android.util.Log.i("AlderMovieboxDirect", "streams type=$type videoId=$videoId title=$titleOverride")
 
         // Parse videoId: "tt<imdb>" or subjectId, optionally ":se:ep" for series
         val cleanVideoId = videoId.removePrefix("moviebox-direct:")
@@ -666,18 +666,17 @@ object MovieboxDirect {
 
         android.util.Log.i("AlderMovieboxDirect", "imdbId=$imdbId se=$playInfoSe ep=$playInfoEp")
 
-        // Get title from Cinemeta (IMDb ID → name + year)
-        val cinemeta = cinemetaTitle(imdbId, type)
-        if (cinemeta == null) {
-            android.util.Log.w("AlderMovieboxDirect", "cinemeta title not found for $imdbId")
+        // Get title: prefer the threaded-in title (100% direct, no Cinemeta), fall back to Cinemeta lookup
+        val title = titleOverride ?: cinemetaTitle(imdbId, type)?.first
+        if (title == null || title.isBlank()) {
+            android.util.Log.w("AlderMovieboxDirect", "title not found for $imdbId")
             return emptyList()
         }
-        val (title, year) = cinemeta
 
-        android.util.Log.i("AlderMovieboxDirect", "title=$title year=$year")
+        android.util.Log.i("AlderMovieboxDirect", "title=$title")
 
         // Search Moviebox by title → subjectId
-        val subjectId = movieboxSubjectId(context, title, year, identity)
+        val subjectId = movieboxSubjectId(context, title, null, identity)
         if (subjectId == null) {
             android.util.Log.w("AlderMovieboxDirect", "moviebox subject not found for $title")
             return emptyList()
@@ -804,16 +803,74 @@ object MovieboxDirect {
             android.util.Log.w("AlderMovieboxDirect", "resources failed: ${e.message}")
         }
 
-        // Resource position recovery (ported from moviebox_resource_position_json_to_release)
-        // Called when play-info/resources only return placeholder clips; recovers the real file.
-        // Needs a resourceId + failUrl from a placeholder stream; skip for now until we have one.
+        // ResourceDetectors from details API (ported from moviebox_detector_json_to_releases)
+        try {
+            val detailsResp = requestWithSession(context, "GET", detailsUrl(subjectId), null, identity)
+            val detailsData = parseResponse(detailsResp)
+            val detectors = detailsData.optJSONArray("resourceDetectors")
+            if (detectors != null) {
+                val detailsTitle = detailsData.optString("title", title)
+                for (i in 0 until detectors.length()) {
+                    val detector = detectors.getJSONObject(i)
+                    val downloadUrl = detector.optString("downloadUrl", "")
+                    val resolutionList = detector.optJSONArray("resolutionList")
+                    val resourceLink = detector.optString("resourceLink", "")
+                    val items = mutableListOf<org.json.JSONObject>()
+                    if (resolutionList != null) {
+                        for (j in 0 until resolutionList.length()) items.add(resolutionList.getJSONObject(j))
+                    } else if (downloadUrl.isNotEmpty()) {
+                        val item = org.json.JSONObject().apply {
+                            put("title", detailsTitle)
+                            put("resourceLink", downloadUrl)
+                            put("se", playInfoSe)
+                            put("ep", playInfoEp)
+                            for (from in listOf("firstSize", "codecName", "resourceId", "uploadBy")) {
+                                val v = detector.opt(from)
+                                if (v != null) put(from, v)
+                            }
+                            val res = resolutionFromSourceLink(resourceLink)
+                            if (res != null) put("resolution", res)
+                        }
+                        items.add(item)
+                    }
+                    for (item in items) {
+                        val url = urlOfJSONObject(item) ?: continue
+                        if (isDeprecationNoticeUrl(url)) continue
+                        if (seenUrls.contains(url)) continue
+                        seenUrls.add(url)
+                        val season = item.optInt("se", 0)
+                        val ep = item.optInt("ep", 0)
+                        if (playInfoSe > 0 && season != playInfoSe) continue
+                        if (playInfoEp > 0 && ep != playInfoEp) continue
+                        val filename = item.optString("fileName", item.optString("title", detailsTitle))
+                        val height = heightOfJSONObject(item)
+                        val codec = codecOfJSONObject(item)
+                        val sizeBytes = sizeOfJSONObject(item)
+                        val descriptionParts = mutableListOf<String>()
+                        if (height != null) descriptionParts.add("${height}p")
+                        if (codec != null) descriptionParts.add(codec)
+                        out.add(Stream(
+                            "moviebox-direct",
+                            "$detailsTitle · ${descriptionParts.joinToString(" · ")} · Direct·Detector",
+                            url,
+                            mapOf("User-Agent" to identity.userAgent),
+                            sizeBytes ?: 0L,
+                            filename,
+                            "MBDUB_$subjectId"
+                        ))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            android.util.Log.w("AlderMovieboxDirect", "detectors failed: ${e.message}")
+        }
 
         android.util.Log.i("AlderMovieboxDirect", "total streams: ${out.size}")
         return out
     }
 
     // ── Subtitles ─────────────────────────────────────────────────────────────────
-    fun subtitles(context: Context, type: String, videoId: String, stream: Stream?): List<Subtitle> {
+    fun subtitles(context: Context, type: String, videoId: String, stream: Stream?, titleOverride: String? = null): List<Subtitle> {
         val identity = generateClientIdentity()
         val out = mutableListOf<Subtitle>()
         val seenUrls = mutableSetOf<String>()
@@ -824,16 +881,15 @@ object MovieboxDirect {
             .split(":".toRegex()).first()
             .split("_".toRegex()).first()
 
-        // Get title from Cinemeta
-        val cinemeta = cinemetaTitle(imdbId, type)
-        if (cinemeta == null) {
-            android.util.Log.w("AlderMovieboxDirect", "cinemeta title not found for $imdbId (subtitles)")
+        // Get title: prefer threaded-in title, fall back to Cinemeta
+        val title = titleOverride ?: cinemetaTitle(imdbId, type)?.first
+        if (title == null || title.isBlank()) {
+            android.util.Log.w("AlderMovieboxDirect", "title not found for $imdbId (subtitles)")
             return emptyList()
         }
-        val (title, year) = cinemeta
 
         // Search Moviebox by title → subjectId
-        val subjectId = movieboxSubjectId(context, title, year, identity)
+        val subjectId = movieboxSubjectId(context, title, null, identity)
         if (subjectId == null) {
             android.util.Log.w("AlderMovieboxDirect", "moviebox subject not found for $title (subtitles)")
             return emptyList()
@@ -973,9 +1029,13 @@ class MovieboxDirectAddon : Addon(
         )
     }
 ) {
+    // Threaded in by StreamsResolver so MovieboxDirect can search by title directly (no Cinemeta).
+    var title: String? = null
+
     override fun streams(type: String, videoId: String, allowTorrents: Boolean): Addon.Streams {
         val ctx = AppContextHolder.context ?: return Addon.Streams(emptyList(), 0, 0)
-        val streams = MovieboxDirect.streams(ctx, type, videoId)
+        val streams = MovieboxDirect.streams(ctx, type, videoId, title)
+        title = null // don't leak across calls
         return Addon.Streams(streams, 0, 0)
     }
 

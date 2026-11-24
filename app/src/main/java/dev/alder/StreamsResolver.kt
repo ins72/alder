@@ -97,6 +97,7 @@ object StreamsResolver {
         videoId: String,
         metaId: String,
         authKey: String?,
+        title: String? = null,
         maxHeight: Int = 0,
         executor: Executor = Screen.pool,
         mainHandler: Handler = Handler(Looper.getMainLooper()),
@@ -124,7 +125,7 @@ object StreamsResolver {
         executor.execute {
             if (canceled) return@execute
             val res = runCatching {
-                val own = (listOf(MovieboxAddon(), HouseAddon(), MovieboxDirectAddon()) + Stremio.addons(key)).filter { it.providesStreams }
+                val own = (listOf(HouseAddon(), MovieboxDirectAddon()) + Stremio.addons(key)).filter { it.providesStreams }
                 val lent = lenders.flatMap { lender ->
                     runCatching {
                         (Stremio.savedAddons(lender.authKey) ?: Stremio.addons(lender.authKey)).filter { it.shareable }
@@ -170,6 +171,9 @@ object StreamsResolver {
             addons.forEachIndexed { i, addon ->
                 executor.execute {
                     if (canceled) return@execute
+                    // Thread the title through to MovieboxDirectAddon so it can search Moviebox by
+                    // title directly (no Cinemeta lookup needed — 100% direct to Moviebox hosts).
+                    if (addon is MovieboxDirectAddon) addon.title = title
                     val streamsResult = runCatching { addon.streams(type, videoId) }
                     mainHandler.post {
                         if (canceled) return@post
@@ -185,7 +189,7 @@ object StreamsResolver {
                                 // Starting on the fast add-on's untagged streams first froze the player's audio menu on
                                 // "English + Italian" and hid every dub. A hard cap still starts if a built-in hangs.
                                 val brandPending = addons.withIndex().any { (i, a) ->
-                                    (a is MovieboxAddon || a is HouseAddon || a is MovieboxDirectAddon) && answers[i] == null
+                                    (a is HouseAddon || a is MovieboxDirectAddon) && answers[i] == null
                                 }
                                 mainHandler.postDelayed({ tryStart(allowGaps = true) }, if (brandPending) 3_000L else 800L)
                             }

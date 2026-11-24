@@ -1002,6 +1002,7 @@ class PlayerActivity : Screen() {
                 type = type,
                 videoId = videoId,
                 metaId = metaId,
+                title = meta?.name,
                 authKey = key,
                 onReady = { best ->
                     resolvingStreams = null
