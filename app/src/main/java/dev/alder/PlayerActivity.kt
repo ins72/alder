@@ -975,7 +975,7 @@ class PlayerActivity : Screen() {
                 main.postDelayed({ if (!isFinishing && !isDestroyed) askSubs(stream) }, SUB_RETRY_WAIT)
             }
             val exact = addonSubs.firstOrNull { "addon:" + it.url == pickedSub }
-            if (subsAnswered) { // playback already started: attach the picked file, or a wanted one if none is on yet
+            if (subsAnswered) { // playback already started: attach the picked file
                 val late = if (chosenSub == null && subsOn) addonSubs.firstOrNull { Languages.same(it.lang, wantSub) } else null
                 val attach = exact ?: late
                 if (attach != null && chosenSub == null && prepared) {
@@ -4144,9 +4144,9 @@ class PlayerActivity : Screen() {
         const val HIDE = 5_000L // ms the controls stay up while playing
         const val START_WAIT = 12_000L // ms for a source to show a picture before the next is tried (4K DV from debrid took 6 s)
         const val ADDON_SUB = "addon-subtitle" // the id an addon subtitle file is attached under
-        const val SUB_WAIT = 2_000L // ms the start waits for the addon's subtitles
-        const val SUB_RETRIES = 2 // extra tries to fetch addon subtitles after an empty/failed answer
-        const val SUB_RETRY_WAIT = 4_000L // ms between addon-subtitle retries
+        const val SUB_WAIT = 4_000L // ms the start waits for the addon's subtitles
+        const val SUB_RETRIES = 3 // extra tries to fetch addon subtitles after an empty/failed answer
+        const val SUB_RETRY_WAIT = 2_000L // ms between addon-subtitle retries
         const val PROBE_RETRIES = 2 // tries to read each source's embedded audio before giving up on it
         const val RETRIES = 2
         const val RETRY_WAIT = 1_500L
