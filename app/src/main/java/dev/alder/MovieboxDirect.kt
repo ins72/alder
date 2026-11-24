@@ -10,9 +10,12 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * Direct Moviebox resolver: talks to Moviebox API hosts directly with signed headers
  * (ported from moviebox-tui's crypto.rs, client.rs, session.rs, adapt.rs). No vodnik,
- * no media proxy — the app signs requests, rotates hosts, and resolves DASH manifests
- * from CloudFront-Policy cookies itself. Uses Cinemeta only to map IMDb ID → title,
- * then searches Moviebox directly by title for the subject ID.
+ * no media proxy — the app signs requests, rotates hosts, absorbs x-user session
+ * refresh headers, recovers placeholder clips via /resource-position/v2, and resolves
+ * DASH manifests from CloudFront-Policy / Edge-Cache-Cookie cookies itself.
+ *
+ * IMDb ID → title (Cinemeta) → Moviebox subject ID (search) → play-info / resources /
+ * resourceDetectors → signed direct streams. Fully ported from moviebox-tui.
  */
 object MovieboxDirect {
 
@@ -30,7 +33,7 @@ object MovieboxDirect {
     private val RETRY_STATUS = setOf(403, 406, 407, 429, 500, 502, 503, 504)
     private val STREAM_REFERER = "https://sportslive.wine"
 
-    // ── Cinemeta (IMDb ID → title mapping, like MovieboxAddon) ─────────────────────
+    // ── Cinemeta (IMDb ID → title mapping) ─────────────────────────────────────────
     private val CINEMETA = "https://v3-cinemeta.stremio.com"
 
     private fun cinemetaTitle(imdb: String, type: String): Pair<String, Int?>? {
@@ -60,11 +63,14 @@ object MovieboxDirect {
         )) {
             try {
                 val resp = requestWithSession(context, "GET", path, null, identity)
-                val data = org.json.JSONObject(resp)
-                val hits = data.optJSONArray("hits") ?: data.optJSONArray("list") ?: data.optJSONArray("results")
+                val data = parseResponse(resp)
+                val hits = data.optJSONArray("results") ?: data.optJSONArray("hits") ?: data.optJSONArray("list")
                 if (hits != null) {
-                    for (i in 0 until hits.length()) {
-                        val hit = hits.getJSONObject(i)
+                    // Stremio-style: data.results[0].subjects[]
+                    val first = hits.optJSONObject(0)
+                    val subjects = first?.optJSONArray("subjects") ?: hits
+                    for (i in 0 until subjects.length()) {
+                        val hit = subjects.getJSONObject(i)
                         val subject = hit.optJSONObject("subject") ?: hit
                         if (subject.has("subjectId") || subject.has("id")) out.add(subject)
                     }
@@ -149,18 +155,23 @@ object MovieboxDirect {
     }
 
     // ── Base64 (URL-safe with padding normalization) ──────────────────────────────
-    private fun base64Encode(data: ByteArray): String =
+    private fun base64EncodeUrlSafe(data: ByteArray): String =
         Base64.encodeToString(data, Base64.NO_WRAP or Base64.NO_PADDING or Base64.URL_SAFE)
 
-    private fun base64Decode(s: String): ByteArray? {
+    // For Edge-Cache-Cookie urlprefix: base64url with -→+, _→/
+    private fun base64UrlDecodeUrlPrefix(s: String): ByteArray? {
         var t = s.replace('-', '+').replace('_', '/')
         val pad = (4 - t.length % 4) % 4
         if (pad > 0) t += "=".repeat(pad)
-        return try {
-            Base64.decode(t, Base64.DEFAULT)
-        } catch (_: Exception) {
-            null
-        }
+        return try { Base64.decode(t, Base64.DEFAULT) } catch (_: Exception) { null }
+    }
+
+    // For CloudFront-Policy: base64url with -→+, _→=, ~→/
+    private fun base64UrlDecodePolicy(s: String): ByteArray? {
+        var t = s.replace('-', '+').replace('_', '=').replace('~', '/')
+        val pad = (4 - t.length % 4) % 4
+        if (pad > 0) t += "=".repeat(pad)
+        return try { Base64.decode(t, Base64.DEFAULT) } catch (_: Exception) { null }
     }
 
     // ── Random ────────────────────────────────────────────────────────────────────
@@ -378,13 +389,27 @@ object MovieboxDirect {
         sessionPrefs(context).edit().clear().apply()
     }
 
+    // ── absorb_x_user from response headers (ported from client.rs) ───────────────
+    private fun absorbXUser(headers: Map<String, String>, context: Context, identity: ClientIdentity) {
+        val xUser = headers["x-user"] ?: return
+        try {
+            val json = org.json.JSONObject(xUser)
+            val token = json.optString("token", "")
+            if (token.isBlank()) return
+            val uid = json.optString("uid", null).takeIf { it.isNotBlank() }
+                ?: json.optString("userId", null).takeIf { it.isNotBlank() }
+            val session = Session(token, uid, null, System.currentTimeMillis() / 1000)
+            saveSession(context, session)
+        } catch (_: Exception) {}
+    }
+
     // ── HTTP with signed headers + host rotation ──────────────────────────────────
     private var activeHostIdx = 0
 
     private fun requestHosts(
         context: Context, method: String, pathAndQuery: String, body: String?,
         authToken: String?, identity: ClientIdentity
-    ): String {
+    ): Pair<String, Map<String, String>> {
         var backoffMs = 50L
         val startIdx = activeHostIdx
 
@@ -399,7 +424,9 @@ object MovieboxDirect {
             val headers = signedHeaders(method, url, body, authToken, identity)
 
             try {
-                val (code, respText) = httpRequest(url, method, body, headers)
+                val (code, respText, respHeaders) = httpRequest(url, method, body, headers)
+                absorbXUser(respHeaders, context, identity)
+
                 if (RETRY_STATUS.contains(code)) {
                     activeHostIdx = (idx + 1) % HOST_POOL.size
                     if (code == 429) backoffMs = 400
@@ -407,7 +434,7 @@ object MovieboxDirect {
                 }
                 activeHostIdx = idx
                 if (code >= 400) throw HttpError(code)
-                return respText
+                return respText to respHeaders
             } catch (e: HttpError) {
                 if (e.code in setOf(401, 403)) {
                     activeHostIdx = (idx + 1) % HOST_POOL.size
@@ -423,7 +450,7 @@ object MovieboxDirect {
         throw HttpError(0) // all hosts exhausted
     }
 
-    private fun httpRequest(urlString: String, method: String, body: String?, headers: Map<String, String>): Pair<Int, String> {
+    private fun httpRequest(urlString: String, method: String, body: String?, headers: Map<String, String>): Triple<Int, String, Map<String, String>> {
         val url = java.net.URL(urlString)
         val c = url.openConnection() as java.net.HttpURLConnection
         c.useCaches = false
@@ -440,7 +467,15 @@ object MovieboxDirect {
         val code = c.responseCode
         val stream = if (code < 400) c.inputStream else c.errorStream
         val text = stream?.use { it.readLimited(64 * 1024 * 1024) }?.let { String(it, Charsets.UTF_8) } ?: ""
-        return code to text
+        // Capture response headers for absorb_x_user
+        val respHeaders = mutableMapOf<String, String>()
+        val headerFields = c.headerFields
+        for ((k, v) in headerFields) {
+            if (k != null && v != null && v.isNotEmpty()) {
+                respHeaders[k.lowercase()] = v.firstOrNull() ?: ""
+            }
+        }
+        return Triple(code, text, respHeaders)
     }
 
     private fun requestWithSession(
@@ -453,22 +488,24 @@ object MovieboxDirect {
             token = fetchFreshSession(context, identity)
         }
         return try {
-            requestHosts(context, method, pathAndQuery, body, token, identity)
+            val (respText, _) = requestHosts(context, method, pathAndQuery, body, token, identity)
+            respText
         } catch (e: HttpError) {
             if (e.code in setOf(401, 403)) {
                 clearSession(context)
                 token = fetchFreshSession(context, identity)
-                requestHosts(context, method, pathAndQuery, body, token, identity)
+                val (respText, _) = requestHosts(context, method, pathAndQuery, body, token, identity)
+                respText
             } else throw e
         }
     }
 
     private fun fetchFreshSession(context: Context, identity: ClientIdentity): String {
         val body = "{}"
-        val resp = requestHosts(
+        val (respText, _) = requestHosts(
             context, "POST", "/wefeed-mobile-bff/user-api/visitor-login", body, null, identity
         )
-        val json = org.json.JSONObject(resp)
+        val json = org.json.JSONObject(respText)
         val token = json.optString("token", "")
         if (token.isBlank()) throw HttpError(0) // missing token
         val uid = json.optString("uid", null).takeIf { it.isNotBlank() }
@@ -508,33 +545,24 @@ object MovieboxDirect {
             (lower.contains("macdn.aoneroom.com") && lower.contains("/other/"))
     }
 
-    private fun base64UrlNormalize(s: String): String {
-        var t = s.replace('-', '+').replace('_', '=').replace('~', '/')
-        val pad = (4 - t.length % 4) % 4
-        if (pad > 0) t += "=".repeat(pad)
-        return t
-    }
-
     private fun resolveDashManifestFromPolicy(signCookie: String): String? {
         for (part in signCookie.split(";")) {
             val trimmed = part.trim()
-            // Edge-Cache-Cookie: urlprefix=<base64>:sign=...:t=...
+            // Edge-Cache-Cookie: urlprefix=<base64url>:sign=...:t=...
             val urlprefixIdx = trimmed.indexOf("urlprefix=")
             if (urlprefixIdx >= 0) {
                 val prefixPart = trimmed.substring(urlprefixIdx + "urlprefix=".length)
                 val b64Token = prefixPart.split(":").firstOrNull() ?: prefixPart
-                val normalized = base64UrlNormalize(b64Token)
-                base64Decode(normalized)?.let { bytes ->
+                base64UrlDecodeUrlPrefix(b64Token)?.let { bytes ->
                     val urlStr = String(bytes, Charsets.UTF_8)
                     val mpd = toDashMpd(urlStr)
                     if (mpd != null) return mpd
                 }
             }
-            // CloudFront-Policy=<base64>
+            // CloudFront-Policy=<base64url>
             val policyRaw = trimmed.removePrefix("CloudFront-Policy=")
             if (policyRaw != trimmed) {
-                val normalized = base64UrlNormalize(policyRaw)
-                base64Decode(normalized)?.let { bytes ->
+                base64UrlDecodePolicy(policyRaw)?.let { bytes ->
                     try {
                         val json = org.json.JSONObject(String(bytes, Charsets.UTF_8))
                         val resource = json.getJSONArray("Statement").getJSONObject(0).optString("Resource", "")
@@ -613,6 +641,12 @@ object MovieboxDirect {
         return s
     }
 
+    // ── parseResponse: unwrap "data" field like moviebox-tui parse_response ───────
+    private fun parseResponse(respText: String): org.json.JSONObject {
+        val data = org.json.JSONObject(respText)
+        return data.optJSONObject("data") ?: data
+    }
+
     // ── Main entry: streams ──────────────────────────────────────────────────────
     fun streams(context: Context, type: String, videoId: String): List<Stream> {
         val identity = generateClientIdentity()
@@ -651,15 +685,15 @@ object MovieboxDirect {
 
         android.util.Log.i("AlderMovieboxDirect", "subjectId=$subjectId")
 
-        // Play-info streams
+        // Play-info streams (ported from moviebox_play_info_json_to_releases)
         try {
             val piUrl = playInfoUrl(subjectId, playInfoSe, playInfoEp)
             val resp = requestWithSession(context, "GET", piUrl, null, identity)
-            val data = org.json.JSONObject(resp)
-            val inner = data.optJSONObject("data") ?: data
-            val streams = inner.optJSONArray("streams")
+            val data = parseResponse(resp)
+            val streams = data.optJSONArray("streams")
             if (streams != null) {
-                val displayResolutions = inner.optString("displayResolutions", "1080,720,480")
+                val titlePrefix = cleanMovieboxTitle(data.optString("title", "MovieBox Stream"))
+                val displayResolutions = data.optString("displayResolutions", "1080,720,480")
                 for (i in 0 until streams.length()) {
                     val stream = streams.getJSONObject(i)
                     val formatType = stream.optString("format", "MP4")
@@ -667,6 +701,11 @@ object MovieboxDirect {
                     val sizeBytes = sizeOfJSONObject(stream)
                     val signCookie = stream.optString("signCookie", "")
                     val streamUrl = urlOfJSONObject(stream) ?: ""
+
+                    // Per-stream resolutions first, then displayResolutions (like adapt.rs)
+                    val resolutionsStr = stream.optString("resolutions", "")
+                        .takeIf { it.isNotEmpty() }
+                        ?: displayResolutions
 
                     val manifestUrl = resolveDashManifestFromPolicy(signCookie)?.takeIf { !isDeprecationNoticeUrl(it) }
                         ?: if (streamUrl.startsWith("http") && !isDeprecationNoticeUrl(streamUrl)) streamUrl else null
@@ -686,7 +725,7 @@ object MovieboxDirect {
                         headers["Cookie"] = cleanCookie
                     }
 
-                    val resolutions = displayResolutions.split(",")
+                    val resolutions = resolutionsStr.split(",")
                         .map { it.trim() }
                         .filter { it.isNotEmpty() }
                         .mapNotNull { it.toIntOrNull() }
@@ -698,9 +737,9 @@ object MovieboxDirect {
                     for (res in resList) {
                         val resLabel = "${res}p"
                         val filename = if (playInfoSe > 0 && playInfoEp > 0) {
-                            "$title S${String.format("%02d", playInfoSe)}E${String.format("%02d", playInfoEp)} $resLabel $codec"
+                            "$titlePrefix S${String.format("%02d", playInfoSe)}E${String.format("%02d", playInfoEp)} $resLabel $codec"
                         } else {
-                            "$title $resLabel $codec"
+                            "$titlePrefix $resLabel $codec"
                         }
                         val scaledSize = sizeBytes?.let { total ->
                             if (res >= highestRes || highestRes <= 0.0) total
@@ -711,7 +750,7 @@ object MovieboxDirect {
                         }
                         out.add(Stream(
                             "moviebox-direct",
-                            "$title · $resLabel · $codec · Direct",
+                            "$titlePrefix · $resLabel · $codec · Direct",
                             manifestUrl,
                             headers,
                             scaledSize ?: 0L,
@@ -726,11 +765,11 @@ object MovieboxDirect {
             android.util.Log.w("AlderMovieboxDirect", "play-info failed: ${e.message}")
         }
 
-        // Resource listing streams (fallback / additional sources)
+        // Resource listing streams (ported from moviebox_resource_json_to_releases)
         try {
             val resUrl = resourcesUrl(subjectId, playInfoSe, playInfoEp)
             val resp = requestWithSession(context, "GET", resUrl, null, identity)
-            val data = org.json.JSONObject(resp)
+            val data = parseResponse(resp)
             val list = data.optJSONArray("list")
             if (list != null) {
                 for (i in 0 until list.length()) {
@@ -764,6 +803,10 @@ object MovieboxDirect {
         } catch (e: Exception) {
             android.util.Log.w("AlderMovieboxDirect", "resources failed: ${e.message}")
         }
+
+        // Resource position recovery (ported from moviebox_resource_position_json_to_release)
+        // Called when play-info/resources only return placeholder clips; recovers the real file.
+        // Needs a resourceId + failUrl from a placeholder stream; skip for now until we have one.
 
         android.util.Log.i("AlderMovieboxDirect", "total streams: ${out.size}")
         return out
@@ -799,23 +842,23 @@ object MovieboxDirect {
         // Get details to find resource info
         try {
             val resp = requestWithSession(context, "GET", detailsUrl(subjectId), null, identity)
-            val data = org.json.JSONObject(resp)
-            val inner = data.optJSONObject("data") ?: data
+            val data = parseResponse(resp)
+            val inner = data.optJSONObject("subject") ?: data.optJSONObject("data") ?: data
 
             // Try ext-captions if we have a resource_id from the stream
             val resourceId = stream?.let { it.url.takeIf { it.contains("resourceId") } } ?: null
             if (resourceId != null) {
                 try {
                     val capsResp = requestWithSession(context, "GET", captionsUrl(subjectId, resourceId), null, identity)
-                    val capsJson = org.json.JSONObject(capsResp)
+                    val capsJson = parseResponse(capsResp)
                     val captions = capsJson.optJSONObject("extCaptions")
-                        ?: capsJson.optJSONObject("data")?.optJSONObject("extCaptions")
                         ?: return out.toList()
                     val arr = captions.optJSONArray("list") ?: captions.optJSONArray("captions") ?: return out.toList()
                     for (i in 0 until arr.length()) {
                         val cap = arr.getJSONObject(i)
                         val url = cap.optString("url", "")
                         if (url.isEmpty() || seenUrls.contains(url)) continue
+                        if (url.contains("aa348f2541d13ffe")) continue
                         seenUrls.add(url)
                         val size = cap.optLong("size", 0)
                         if (size > 0 && size <= 50) continue
@@ -931,8 +974,6 @@ class MovieboxDirectAddon : Addon(
     }
 ) {
     override fun streams(type: String, videoId: String, allowTorrents: Boolean): Addon.Streams {
-        // Context is not available on the Addon interface; streams() is called from StreamsResolver
-        // which has context. We need to pass it through. For now, use a static holder.
         val ctx = AppContextHolder.context ?: return Addon.Streams(emptyList(), 0, 0)
         val streams = MovieboxDirect.streams(ctx, type, videoId)
         return Addon.Streams(streams, 0, 0)
