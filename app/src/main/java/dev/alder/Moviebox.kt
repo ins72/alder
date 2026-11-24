@@ -162,6 +162,18 @@ object Moviebox {
         else -> 4
     }
 
+    // Union of two subjects' sources for one language: de-dupe by (height, codecs) and order highest-first with HEVC
+    // before H264/AV1 at the same height, so the player's first row is the best quality that language offers.
+    private fun mergeSources(a: List<MBSource>, b: List<MBSource>): List<MBSource> {
+        val seen = HashSet<String>()
+        val out = ArrayList<MBSource>()
+        for (s in a + b) {
+            if (s.height <= 0) continue
+            if (seen.add("${s.height}|${s.codecs.joinToString(",")}")) out.add(s)
+        }
+        return out.sortedWith(compareByDescending<MBSource> { it.height }.thenBy { codecRank(it.codecs.firstOrNull().orEmpty()) })
+    }
+
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8").replace("+", "%20")
 
     private fun json(url: String, timeoutMs: Int = TIMEOUT): Any =
@@ -543,6 +555,34 @@ object Moviebox {
         android.util.Log.i("AlderStreams", "variants(pre-merge): " + variants.joinToString(" | ") {
             "orig=${it.original} lang=${it.lang} label='${it.label}' heights=[${it.sources.map { s -> s.height }.distinct().joinToString(",")}]"
         })
+
+        // A title's dubs are spread across several Moviebox subjects, and the same audio language can appear on more
+        // than one (two "Hindi" subjects, an English-tagged release separate from the untagged original). Collapse
+        // them to ONE variant per language, merging every subject's sources so each language plays at the best quality
+        // any of them offers: the original is often only a 480p placeholder while a 1080p release of the same film
+        // sits on another subject. The original/untagged audio is treated as English, so an English-tagged release
+        // folds into it and English plays at its best resolution too.
+        val merged = LinkedHashMap<String, MBVariant>()
+        for (v in variants) {
+            val key = when {
+                v.original -> "eng"
+                v.lang == "und" || v.lang.isEmpty() -> "und"
+                else -> v.lang
+            }
+            val existing = merged[key]
+            if (existing == null) {
+                merged[key] = v
+            } else {
+                existing.sources = mergeSources(existing.sources, v.sources)
+                existing.url = existing.sources.firstOrNull()?.url ?: existing.url
+                existing.original = existing.original || v.original
+                val have = HashSet(existing.subtitles.map { it.lan.lowercase() })
+                for (t in v.subtitles) if (have.add(t.lan.lowercase())) existing.subtitles.add(t)
+            }
+        }
+        val mergedVariants = ArrayList(merged.values)
+        variants.clear()
+        variants.addAll(mergedVariants)
 
         // Original audio first; it is what plays unless the viewer's audio preference matches a dub.
         variants.sortByDescending { if (it.original) 1 else 0 }
