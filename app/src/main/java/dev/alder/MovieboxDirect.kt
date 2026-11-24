@@ -10,8 +10,9 @@ import javax.crypto.spec.SecretKeySpec
 /**
  * Direct Moviebox resolver: talks to Moviebox API hosts directly with signed headers
  * (ported from moviebox-tui's crypto.rs, client.rs, session.rs, adapt.rs). No vodnik,
- * no media proxy, no Cinemeta — the app signs requests, rotates hosts, and resolves
- * DASH manifests from CloudFront-Policy cookies itself.
+ * no media proxy — the app signs requests, rotates hosts, and resolves DASH manifests
+ * from CloudFront-Policy cookies itself. Uses Cinemeta only to map IMDb ID → title,
+ * then searches Moviebox directly by title for the subject ID.
  */
 object MovieboxDirect {
 
@@ -28,6 +29,90 @@ object MovieboxDirect {
 
     private val RETRY_STATUS = setOf(403, 406, 407, 429, 500, 502, 503, 504)
     private val STREAM_REFERER = "https://sportslive.wine"
+
+    // ── Cinemeta (IMDb ID → title mapping, like MovieboxAddon) ─────────────────────
+    private val CINEMETA = "https://v3-cinemeta.stremio.com"
+
+    private fun cinemetaTitle(imdb: String, type: String): Pair<String, Int?>? {
+        try {
+            val resp = Http.get("$CINEMETA/meta/$type/$imdb.json", false, 10_000, strict = false)
+            val meta = org.json.JSONObject(resp).optJSONObject("meta") ?: return null
+            val name = meta.optString("name", "")
+            if (name.isBlank()) return null
+            val year = meta.optString("year", "").toIntOrNull()
+                ?: meta.optString("releaseInfo", "").toIntOrNull()
+                ?: meta.optString("released", "").toIntOrNull()
+            return name to year
+        } catch (_: Exception) {
+            return null
+        }
+    }
+
+    private fun compactTitle(name: String): String =
+        name.lowercase().replace("[^a-z0-9 ]".toRegex(), "").replace("  ", " ").trim()
+
+    // ── Search Moviebox by title → subjectId ──────────────────────────────────────
+    private fun movieboxSearch(context: Context, query: String, page: Int, identity: ClientIdentity): List<org.json.JSONObject> {
+        var out = mutableListOf<org.json.JSONObject>()
+        for (path in listOf(
+            "/wefeed-mobile-bff/subject-api/search?q=${java.net.URLEncoder.encode(query, Charsets.UTF_8.name())}&page=$page",
+            "/wefeed-mobile-bff/subject-api/search/all?q=${java.net.URLEncoder.encode(query, Charsets.UTF_8.name())}&page=$page"
+        )) {
+            try {
+                val resp = requestWithSession(context, "GET", path, null, identity)
+                val data = org.json.JSONObject(resp)
+                val hits = data.optJSONArray("hits") ?: data.optJSONArray("list") ?: data.optJSONArray("results")
+                if (hits != null) {
+                    for (i in 0 until hits.length()) {
+                        val hit = hits.getJSONObject(i)
+                        val subject = hit.optJSONObject("subject") ?: hit
+                        if (subject.has("subjectId") || subject.has("id")) out.add(subject)
+                    }
+                }
+            } catch (_: Exception) {}
+        }
+        return out
+    }
+
+    private fun movieboxSubjectId(context: Context, name: String, year: Int?, identity: ClientIdentity): String? {
+        val wanted = compactTitle(name)
+        val queries = LinkedHashSet<String>()
+        queries.add(name)
+        queries.add(name.replace("\u2019".toRegex(), "'").replace("\u2018".toRegex(), "'"))
+        queries.add(name.split(" - |:|\\|".toRegex()).first())
+        for (q in queries.take(3)) {
+            if (q.isBlank()) continue
+            // exact match first
+            for (subject in movieboxSearch(context, q, 1, identity)) {
+                val sName = subject.optString("name", "")
+                val sYear = subject.optString("year", "").toIntOrNull()
+                    ?: subject.optString("releaseInfo", "").toIntOrNull()
+                    ?: subject.optString("released", "").toIntOrNull()
+                if (compactTitle(sName) == wanted &&
+                    (year == null || sYear == null || sYear == year)) {
+                    return subject.optString("subjectId", "")
+                        ?: subject.optString("id", "")
+                        ?: subject.optLong("id").let { if (it > 0) it.toString() else null }
+                }
+            }
+            // prefix match with year agreement
+            for (subject in movieboxSearch(context, q, 1, identity)) {
+                val sName = subject.optString("name", "")
+                val sYear = subject.optString("year", "").toIntOrNull()
+                    ?: subject.optString("releaseInfo", "").toIntOrNull()
+                    ?: subject.optString("released", "").toIntOrNull()
+                if (compactTitle(sName).startsWith(wanted) ||
+                    wanted.startsWith(compactTitle(sName))) {
+                    if (year == null || sYear == null || sYear == year) {
+                        return subject.optString("subjectId", "")
+                            ?: subject.optString("id", "")
+                            ?: subject.optLong("id").let { if (it > 0) it.toString() else null }
+                    }
+                }
+            }
+        }
+        return null
+    }
 
     // ── Crypto constants (ported from moviebox-tui crypto.rs) ─────────────────────
     private val DEFAULT_SECRET_BYTES = byteArrayOf(
@@ -536,27 +621,35 @@ object MovieboxDirect {
 
         android.util.Log.i("AlderMovieboxDirect", "streams type=$type videoId=$videoId")
 
-        // Parse videoId: "tt<imdb>" or subjectId, optionally "subjectId_se_ep" for series
-        val subjectId = videoId.removePrefix("tt").removePrefix("moviebox-direct:")
-        val parts = videoId.split("_")
-        val playInfoSe = if (parts.size >= 3) parts[1].toIntOrNull() ?: 0 else 0
+        // Parse videoId: "tt<imdb>" or subjectId, optionally ":se:ep" for series
+        val cleanVideoId = videoId.removePrefix("moviebox-direct:")
+        val imdbId = cleanVideoId.removePrefix("tt")
+            .split(":".toRegex()).first()
+            .split("_".toRegex()).first()
+        val parts = cleanVideoId.split(":".toRegex())
+        val playInfoSe = if (parts.size >= 2) parts[1].toIntOrNull() ?: 0 else 0
         val playInfoEp = if (parts.size >= 3) parts[2].toIntOrNull() ?: 0 else 0
 
-        android.util.Log.i("AlderMovieboxDirect", "subjectId=$subjectId se=$playInfoSe ep=$playInfoEp")
+        android.util.Log.i("AlderMovieboxDirect", "imdbId=$imdbId se=$playInfoSe ep=$playInfoEp")
 
-        // Get details for season/episode info and dubs
-        var detailsJson: org.json.JSONObject? = null
-        try {
-            val resp = requestWithSession(context, "GET", detailsUrl(subjectId), null, identity)
-            detailsJson = org.json.JSONObject(resp)
-            android.util.Log.i("AlderMovieboxDirect", "details OK")
-        } catch (e: Exception) {
-            android.util.Log.w("AlderMovieboxDirect", "details failed: ${e.message}")
+        // Get title from Cinemeta (IMDb ID → name + year)
+        val cinemeta = cinemetaTitle(imdbId, type)
+        if (cinemeta == null) {
+            android.util.Log.w("AlderMovieboxDirect", "cinemeta title not found for $imdbId")
+            return emptyList()
+        }
+        val (title, year) = cinemeta
+
+        android.util.Log.i("AlderMovieboxDirect", "title=$title year=$year")
+
+        // Search Moviebox by title → subjectId
+        val subjectId = movieboxSubjectId(context, title, year, identity)
+        if (subjectId == null) {
+            android.util.Log.w("AlderMovieboxDirect", "moviebox subject not found for $title")
+            return emptyList()
         }
 
-        val titlePrefix = cleanMovieboxTitle(detailsJson?.optJSONObject("data")?.optString("title", "MovieBox Stream")
-            ?: detailsJson?.optString("title", "MovieBox Stream")
-            ?: "MovieBox Stream")
+        android.util.Log.i("AlderMovieboxDirect", "subjectId=$subjectId")
 
         // Play-info streams
         try {
@@ -569,7 +662,6 @@ object MovieboxDirect {
                 val displayResolutions = inner.optString("displayResolutions", "1080,720,480")
                 for (i in 0 until streams.length()) {
                     val stream = streams.getJSONObject(i)
-                    val streamId = stream.optString("id", "")
                     val formatType = stream.optString("format", "MP4")
                     val codec = codecOfJSONObject(stream) ?: formatType
                     val sizeBytes = sizeOfJSONObject(stream)
@@ -606,9 +698,9 @@ object MovieboxDirect {
                     for (res in resList) {
                         val resLabel = "${res}p"
                         val filename = if (playInfoSe > 0 && playInfoEp > 0) {
-                            "$titlePrefix S${String.format("%02d", playInfoSe)}E${String.format("%02d", playInfoEp)} $resLabel $codec"
+                            "$title S${String.format("%02d", playInfoSe)}E${String.format("%02d", playInfoEp)} $resLabel $codec"
                         } else {
-                            "$titlePrefix $resLabel $codec"
+                            "$title $resLabel $codec"
                         }
                         val scaledSize = sizeBytes?.let { total ->
                             if (res >= highestRes || highestRes <= 0.0) total
@@ -619,7 +711,7 @@ object MovieboxDirect {
                         }
                         out.add(Stream(
                             "moviebox-direct",
-                            "$titlePrefix · $resLabel · $codec · Direct",
+                            "$title · $resLabel · $codec · Direct",
                             manifestUrl,
                             headers,
                             scaledSize ?: 0L,
@@ -652,7 +744,6 @@ object MovieboxDirect {
                     val codec = codecOfJSONObject(releaseItem)
                     val lang = languageOfJSONObject(releaseItem)
                     val sizeBytes = sizeOfJSONObject(releaseItem)
-                    val rid = resourceIdOfJSONObject(releaseItem)
                     val se = item.optInt("se", 0)
                     val ep = item.optInt("ep", 0)
                     val descriptionParts = mutableListOf<String>()
@@ -661,7 +752,7 @@ object MovieboxDirect {
                     if (lang != null) descriptionParts.add(lang)
                     out.add(Stream(
                         "moviebox-direct",
-                        "$titlePrefix · ${descriptionParts.joinToString(" · ")} · Direct",
+                        "$title · ${descriptionParts.joinToString(" · ")} · Direct",
                         url,
                         mapOf("User-Agent" to identity.userAgent),
                         sizeBytes ?: 0L,
@@ -681,17 +772,37 @@ object MovieboxDirect {
     // ── Subtitles ─────────────────────────────────────────────────────────────────
     fun subtitles(context: Context, type: String, videoId: String, stream: Stream?): List<Subtitle> {
         val identity = generateClientIdentity()
-        val subjectId = videoId.removePrefix("tt")
         val out = mutableListOf<Subtitle>()
         val seenUrls = mutableSetOf<String>()
 
-        // Get details to find subject info
+        // Parse videoId → IMDb ID
+        val cleanVideoId = videoId.removePrefix("moviebox-direct:")
+        val imdbId = cleanVideoId.removePrefix("tt")
+            .split(":".toRegex()).first()
+            .split("_".toRegex()).first()
+
+        // Get title from Cinemeta
+        val cinemeta = cinemetaTitle(imdbId, type)
+        if (cinemeta == null) {
+            android.util.Log.w("AlderMovieboxDirect", "cinemeta title not found for $imdbId (subtitles)")
+            return emptyList()
+        }
+        val (title, year) = cinemeta
+
+        // Search Moviebox by title → subjectId
+        val subjectId = movieboxSubjectId(context, title, year, identity)
+        if (subjectId == null) {
+            android.util.Log.w("AlderMovieboxDirect", "moviebox subject not found for $title (subtitles)")
+            return emptyList()
+        }
+
+        // Get details to find resource info
         try {
             val resp = requestWithSession(context, "GET", detailsUrl(subjectId), null, identity)
             val data = org.json.JSONObject(resp)
             val inner = data.optJSONObject("data") ?: data
 
-            // Try ext-captions if we have a resource_id
+            // Try ext-captions if we have a resource_id from the stream
             val resourceId = stream?.let { it.url.takeIf { it.contains("resourceId") } } ?: null
             if (resourceId != null) {
                 try {
