@@ -362,8 +362,9 @@ object MovieboxDirect {
         context: Context, method: String, pathAndQuery: String, body: String?,
         identity: ClientIdentity
     ): String {
-        var token = loadSession(context)?.token
-        if (token == null || !loadSession(context)!!.isValid()) {
+        val session = loadSession(context)
+        var token = session?.token
+        if (token == null || session?.isValid() != true) {
             token = fetchFreshSession(context, identity)
         }
         return try {
@@ -533,25 +534,25 @@ object MovieboxDirect {
         val out = mutableListOf<Stream>()
         val seenUrls = mutableSetOf<String>()
 
-        // Parse videoId: "tt<imdb>" or subjectId
-        val subjectId = videoId.removePrefix("tt")
+        android.util.Log.i("AlderMovieboxDirect", "streams type=$type videoId=$videoId")
 
-        // Try play-info first (most direct source of streams)
-        val playInfoSe = try {
-            val parts = videoId.split("_")
-            if (parts.size >= 3) parts[1].toIntOrNull() ?: 0 else 0
-        } catch (_: Exception) { 0 }
-        val playInfoEp = try {
-            val parts = videoId.split("_")
-            if (parts.size >= 3) parts[2].toIntOrNull() ?: 0 else 0
-        } catch (_: Exception) { 0 }
+        // Parse videoId: "tt<imdb>" or subjectId, optionally "subjectId_se_ep" for series
+        val subjectId = videoId.removePrefix("tt").removePrefix("moviebox-direct:")
+        val parts = videoId.split("_")
+        val playInfoSe = if (parts.size >= 3) parts[1].toIntOrNull() ?: 0 else 0
+        val playInfoEp = if (parts.size >= 3) parts[2].toIntOrNull() ?: 0 else 0
+
+        android.util.Log.i("AlderMovieboxDirect", "subjectId=$subjectId se=$playInfoSe ep=$playInfoEp")
 
         // Get details for season/episode info and dubs
         var detailsJson: org.json.JSONObject? = null
         try {
             val resp = requestWithSession(context, "GET", detailsUrl(subjectId), null, identity)
             detailsJson = org.json.JSONObject(resp)
-        } catch (_: Exception) {}
+            android.util.Log.i("AlderMovieboxDirect", "details OK")
+        } catch (e: Exception) {
+            android.util.Log.w("AlderMovieboxDirect", "details failed: ${e.message}")
+        }
 
         val titlePrefix = cleanMovieboxTitle(detailsJson?.optJSONObject("data")?.optString("title", "MovieBox Stream")
             ?: detailsJson?.optString("title", "MovieBox Stream")
@@ -628,7 +629,10 @@ object MovieboxDirect {
                     }
                 }
             }
-        } catch (_: Exception) {}
+            android.util.Log.i("AlderMovieboxDirect", "play-info streams: ${out.size}")
+        } catch (e: Exception) {
+            android.util.Log.w("AlderMovieboxDirect", "play-info failed: ${e.message}")
+        }
 
         // Resource listing streams (fallback / additional sources)
         try {
@@ -666,13 +670,11 @@ object MovieboxDirect {
                     ))
                 }
             }
-        } catch (_: Exception) {}
-
-        // If still nothing, try resource recovery for placeholder clips
-        if (out.isEmpty() && detailsJson != null) {
-            // Resource recovery would need resource_id from a placeholder; skip for now
+        } catch (e: Exception) {
+            android.util.Log.w("AlderMovieboxDirect", "resources failed: ${e.message}")
         }
 
+        android.util.Log.i("AlderMovieboxDirect", "total streams: ${out.size}")
         return out
     }
 
