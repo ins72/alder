@@ -928,7 +928,8 @@ class PlayerActivity : Screen() {
                 pendingResume = resume
                 return
             }
-            if (!subsAnswered) { waiting = resume; return }
+            // Start playback at once; do not block the picture on subtitle add-ons. Subtitles attach
+            // when they arrive (see the late-subs path in askSubs), usually well before the wait expires.
             load(resume)
             lastPosition = resume
             prepared = true
@@ -941,8 +942,9 @@ class PlayerActivity : Screen() {
             begin(0L)
             return
         }
+        // Still ask for subtitles so they can be attached once they arrive, but never hold the picture for them.
         val waitMs = if (pickedSub?.startsWith("addon:") == true) 3_500L else SUB_WAIT
-        val stopWaiting = Runnable { if (!isDestroyed) { subsAnswered = true; waiting?.let(::begin) } } // left during the wait: no start
+        val stopWaiting = Runnable { if (!isDestroyed) { subsAnswered = true } } // playback already started
         main.postDelayed(stopWaiting, waitMs)
         // Asked with the stream's file name and size when they're known, so the addon puts files for that release
         // first. A stream found here (Continue Watching) asks again once it's known; an older answer never replaces a newer one.
