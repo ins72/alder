@@ -298,6 +298,13 @@ class PlayerActivity : Screen() {
 
     override fun startActivity(intent: Intent?, options: android.os.Bundle?) { ownNav = true; super.startActivity(intent, options) }
 
+    // singleTop: tapping the app icon while in PiP brings this activity to the front instead of
+    // launching a new MainActivity, so the player page continues the video.
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        setIntent(intent ?: Intent())
+    }
+
     override fun onResume() { super.onResume(); ownNav = false }
 
     override fun onUserLeaveHint() {
@@ -2422,9 +2429,9 @@ class PlayerActivity : Screen() {
             }
         }
 
-        audioButton = button(getString(R.string.player_audio_subtitles), R.drawable.ic_subtitles) { openOptions() }
+        audioButton = button(getString(R.string.player_audio_subtitles), R.drawable.ic_subtitles) { openOptions(1) }
         // Opens the Audio tab (dub languages); the language icon fits picking an audio track better than the old layers icon.
-        val streamButton = button(getString(R.string.player_change_stream), R.drawable.ic_language) { openOptions(1) }
+        val streamButton = button(getString(R.string.player_change_stream), R.drawable.ic_language) { openOptions() }
         // Shows the speed itself rather than an icon; OK opens the list of speeds above it.
         speedButton = button(getString(R.string.player_speed), 0) { openSpeedMenu() }.apply {
             text = speedLabel(speed)
