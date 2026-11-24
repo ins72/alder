@@ -1,5 +1,6 @@
 package dev.alder
 
+import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.BitmapDrawable
@@ -42,6 +43,23 @@ class ProfilesActivity : Screen() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         Branding.init(this)
+        // If the viewer left the player in Picture-in-Picture and is now tapping the app icon from home,
+        // bring the active player back instead of showing the profile picker / home.
+        val prefs = getSharedPreferences("pip_resume", Context.MODE_PRIVATE)
+        if (prefs.getBoolean("active", false)) {
+            prefs.edit().putBoolean("active", false).apply()
+            val intent = Intent(this, PlayerActivity::class.java).apply {
+                putExtra("type", prefs.getString("type", "movie"))
+                putExtra("id", prefs.getString("metaId", ""))
+                putExtra("videoId", prefs.getString("videoId", ""))
+                putExtra("name", prefs.getString("name", ""))
+                putExtra("picked", true)
+                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            }
+            startActivity(intent)
+            finish()
+            return
+        }
         // Pull the operator's branding (product name, sign-in lines) so this screen reads "<name>" not a hardcoded
         // one; it is cached for next time and refreshed here when the network answers.
         background({ runCatching { Stremio.config() }.getOrNull() }) { r ->

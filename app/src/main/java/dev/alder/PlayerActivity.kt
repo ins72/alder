@@ -310,11 +310,18 @@ class PlayerActivity : Screen() {
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         if (ownNav || isFinishing || !Handheld.isHandheld(this) || android.os.Build.VERSION.SDK_INT < 26 || !::player.isInitialized) return
-        // Enter PiP whenever a video is loaded and the viewer leaves — even mid-load. The old check required a
-        // frame to have rendered and the player to be actively playing; a swipe that nudged the picture into
-        // buffering then stopped PiP from opening at all. Only STATE_IDLE (nothing loaded) has nothing to show.
         if (player.playbackState == Player.STATE_IDLE) return
         if (!packageManager.hasSystemFeature(android.content.pm.PackageManager.FEATURE_PICTURE_IN_PICTURE)) return
+        // Remember what was playing so ProfilesActivity (the launcher) can bring the player back
+        // when the viewer taps the app icon from home while it's in PiP.
+        val prefs = getSharedPreferences("pip_resume", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString("type", type)
+            .putString("videoId", videoId)
+            .putString("metaId", metaId)
+            .putString("name", intent.getStringExtra("name"))
+            .putBoolean("active", true)
+            .apply()
         runCatching { enterPictureInPictureMode(pipParams()) }
     }
 
@@ -2429,9 +2436,9 @@ class PlayerActivity : Screen() {
             }
         }
 
-        audioButton = button(getString(R.string.player_audio_subtitles), R.drawable.ic_subtitles) { openOptions(1) }
+        audioButton = button(getString(R.string.player_audio_subtitles), R.drawable.ic_subtitles) { openOptions() }
         // Opens the Audio tab (dub languages); the language icon fits picking an audio track better than the old layers icon.
-        val streamButton = button(getString(R.string.player_change_stream), R.drawable.ic_language) { openOptions() }
+        val streamButton = button(getString(R.string.player_change_stream), R.drawable.ic_language) { openOptions(1) }
         // Shows the speed itself rather than an icon; OK opens the list of speeds above it.
         speedButton = button(getString(R.string.player_speed), 0) { openSpeedMenu() }.apply {
             text = speedLabel(speed)
@@ -2467,8 +2474,8 @@ class PlayerActivity : Screen() {
                 addView(LinearLayout(context).apply {
                     clipChildren = false; clipToPadding = false
                     gravity = Gravity.END or Gravity.TOP
-                    addView(buttonCell(streamButton))
                     addView(buttonCell(audioButton))
+                    addView(buttonCell(streamButton))
                     addView(View(context).apply { setBackgroundColor(GLASS_EDGE) },
                         LinearLayout.LayoutParams(dp(1), dp(22)).apply { topMargin = dp(14); marginEnd = dp(10) })
                 }, LinearLayout.LayoutParams(0, -2, 1f))

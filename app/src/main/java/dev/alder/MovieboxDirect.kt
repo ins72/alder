@@ -735,6 +735,8 @@ object MovieboxDirect {
 
                     for (res in resList) {
                         val resLabel = "${res}p"
+                        val lang = languageOfJSONObject(stream)
+                        val langName = lang?.let { Languages.name(it) } ?: ""
                         val filename = if (playInfoSe > 0 && playInfoEp > 0) {
                             "$titlePrefix S${String.format("%02d", playInfoSe)}E${String.format("%02d", playInfoEp)} $resLabel $codec"
                         } else {
@@ -749,12 +751,14 @@ object MovieboxDirect {
                         }
                         out.add(Stream(
                             "moviebox-direct",
-                            "$titlePrefix · $resLabel · $codec · Direct",
+                            "$titlePrefix · ${if (langName.isNotEmpty()) langName + " · " else ""}$resLabel · $codec · Direct",
                             manifestUrl,
                             headers,
                             scaledSize ?: 0L,
                             filename,
-                            "MBDUB_$subjectId"
+                            "MBDUB_$subjectId",
+                            null,
+                            if (lang != null) setOf(lang) else emptySet()
                         ))
                     }
                 }
@@ -795,7 +799,9 @@ object MovieboxDirect {
                         mapOf("User-Agent" to identity.userAgent),
                         sizeBytes ?: 0L,
                         filename,
-                        "MBDUB_$subjectId"
+                        "MBDUB_$subjectId",
+                        null,
+                        if (lang != null) setOf(lang) else emptySet()
                     ))
                 }
             }
@@ -845,10 +851,12 @@ object MovieboxDirect {
                         val filename = item.optString("fileName", item.optString("title", detailsTitle))
                         val height = heightOfJSONObject(item)
                         val codec = codecOfJSONObject(item)
+                        val lang = languageOfJSONObject(item)
                         val sizeBytes = sizeOfJSONObject(item)
                         val descriptionParts = mutableListOf<String>()
                         if (height != null) descriptionParts.add("${height}p")
                         if (codec != null) descriptionParts.add(codec)
+                        if (lang != null) descriptionParts.add(Languages.name(lang))
                         out.add(Stream(
                             "moviebox-direct",
                             "$detailsTitle · ${descriptionParts.joinToString(" · ")} · Direct·Detector",
@@ -856,7 +864,9 @@ object MovieboxDirect {
                             mapOf("User-Agent" to identity.userAgent),
                             sizeBytes ?: 0L,
                             filename,
-                            "MBDUB_$subjectId"
+                            "MBDUB_$subjectId",
+                            null,
+                            if (lang != null) setOf(lang) else emptySet()
                         ))
                     }
                 }
