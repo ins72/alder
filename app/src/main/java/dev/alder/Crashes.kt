@@ -7,6 +7,7 @@ import java.io.File
 class App : android.app.Application() {
     override fun onCreate() {
         super.onCreate()
+        AppContextHolder.context = this
         ProgressSaves.init(this)
         Crashes.install(this)
     }
